@@ -132,14 +132,58 @@
         </div>
 
         <div
-          id="header-info"
-          class="hidden md:flex gap-6 text-sm text-gray-400"
+          id="slide-nav"
+          class="flex items-center gap-2 min-w-0 flex-1 justify-center px-2"
         >
-          <span id="format-info" class="font-medium text-gray-300"></span>
-          <span id="dimensions-info"></span>
+          <button
+            id="slide-prev"
+            type="button"
+            title="Previous slide"
+            class="hidden shrink-0 rounded-lg p-2 text-gray-300 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:pointer-events-none transition-colors"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke-width="2"
+              stroke="currentColor"
+              class="w-5 h-5"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d="M15.75 19.5L8.25 12l7.5-7.5"
+              />
+            </svg>
+          </button>
+          <h2
+            id="header-slide-name"
+            class="min-w-0 flex-1 truncate text-center text-sm font-medium text-gray-200 sm:text-base"
+          ></h2>
+          <button
+            id="slide-next"
+            type="button"
+            title="Next slide"
+            class="hidden shrink-0 rounded-lg p-2 text-gray-300 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:pointer-events-none transition-colors"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke-width="2"
+              stroke="currentColor"
+              class="w-5 h-5"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d="M8.25 4.5l7.5 7.5-7.5 7.5"
+              />
+            </svg>
+          </button>
         </div>
 
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-3 shrink-0">
           <a
             id="files-link"
             href="/"
@@ -788,6 +832,22 @@
         );
       }
 
+      function heatmapColorbarUrl(cmap) {
+        return withSlide(
+          "/heatmap-colorbar.png?cmap=" +
+            encodeURIComponent(cmap || "jet") +
+            "&width=160&height=24"
+        );
+      }
+
+      function formatHeatmapValue(value) {
+        if (value == null || !Number.isFinite(value)) return "—";
+        const abs = Math.abs(value);
+        if (abs >= 100) return value.toFixed(0);
+        if (abs >= 10) return value.toFixed(1);
+        return value.toFixed(2);
+      }
+
       function updateHeatmapCount() {
         const el = document.getElementById("heatmap-count");
         if (!el) return;
@@ -892,8 +952,29 @@
             if (name === g.colormap) opt.selected = true;
             cmapSelect.appendChild(opt);
           });
+
+          const colorbarWrap = document.createElement("div");
+          colorbarWrap.className = "space-y-1 pt-1";
+          const colorbarImg = document.createElement("img");
+          colorbarImg.alt = "";
+          colorbarImg.className =
+            "w-full h-6 rounded border border-gray-700/80 object-fill";
+          colorbarImg.src = heatmapColorbarUrl(g.colormap);
+          const colorbarLabels = document.createElement("div");
+          colorbarLabels.className =
+            "flex justify-between text-xs tabular-nums text-gray-500";
+          const minLabel = document.createElement("span");
+          minLabel.textContent = "0";
+          const maxLabel = document.createElement("span");
+          maxLabel.textContent = formatHeatmapValue(g.maxValue);
+          colorbarLabels.appendChild(minLabel);
+          colorbarLabels.appendChild(maxLabel);
+          colorbarWrap.appendChild(colorbarImg);
+          colorbarWrap.appendChild(colorbarLabels);
+
           cmapSelect.addEventListener("change", () => {
             g.colormap = cmapSelect.value;
+            colorbarImg.src = heatmapColorbarUrl(g.colormap);
             // Re-fetch the heatmap image rendered with the new colormap.
             if (g.layer) {
               g.layer.setSource(
@@ -909,6 +990,7 @@
           cmapField.appendChild(cmapSpan);
           cmapField.appendChild(cmapSelect);
           card.appendChild(cmapField);
+          card.appendChild(colorbarWrap);
 
           container.appendChild(card);
         });
@@ -926,6 +1008,7 @@
             extent: h.extent.map(Number),
             width: h.width,
             height: h.height,
+            maxValue: h.max_value,
             layer: null,
             visible: true,
             opacity: 0.6,
@@ -944,6 +1027,52 @@
       const slideParam = new URLSearchParams(window.location.search).get(
         "slide"
       );
+      let slideList = [];
+
+      function goToSlide(relpath) {
+        window.location.href =
+          "/viewer?slide=" + encodeURIComponent(relpath);
+      }
+
+      async function initSlideNav() {
+        const prevBtn = document.getElementById("slide-prev");
+        const nextBtn = document.getElementById("slide-next");
+        if (!slideParam) {
+          return;
+        }
+        prevBtn.classList.remove("hidden");
+        nextBtn.classList.remove("hidden");
+        try {
+          const resp = await fetch("/api/slides");
+          if (!resp.ok) return;
+          const data = await resp.json();
+          slideList = (data.slides || []).map((s) => s.path).sort();
+        } catch (err) {
+          return;
+        }
+        const idx = slideList.indexOf(slideParam);
+        if (idx < 0) return;
+        prevBtn.disabled = idx <= 0;
+        nextBtn.disabled = idx >= slideList.length - 1;
+        prevBtn.onclick = () => {
+          if (idx > 0) goToSlide(slideList[idx - 1]);
+        };
+        nextBtn.onclick = () => {
+          if (idx < slideList.length - 1) goToSlide(slideList[idx + 1]);
+        };
+      }
+
+      function updateHeaderSlideName() {
+        const name = slideInfo ? slideInfo.name || "-" : "-";
+        const el = document.getElementById("header-slide-name");
+        if (el) {
+          el.textContent = name;
+          el.title = name;
+        }
+        if (slideInfo && slideInfo.name) {
+          document.title = slideInfo.name + " – FastSlide XYZ";
+        }
+      }
 
       function withSlide(url) {
         if (!slideParam) return url;
@@ -1088,15 +1217,13 @@
 
       function populateSidebar() {
         const image = currentImage();
+        updateHeaderSlideName();
         document.getElementById("info-name").textContent =
           slideInfo.name || "-";
         document.getElementById("info-format").textContent =
           slideInfo.format || "-";
-        document.getElementById("format-info").textContent =
-          slideInfo.format || "";
         const dims = `${image.dimensions[0]} × ${image.dimensions[1]}`;
         document.getElementById("info-dimensions").textContent = dims;
-        document.getElementById("dimensions-info").textContent = dims;
         document.getElementById("info-mpp").textContent = image.mpp
           ? ((image.mpp[0] + image.mpp[1]) / 2).toFixed(4)
           : "N/A";
@@ -1132,7 +1259,9 @@
         }
         slideInfo = await resp.json();
         currentImageIndex = slideInfo.primary_index || 0;
+        updateHeaderSlideName();
 
+        await initSlideNav();
         populateImageSwitcher();
         await loadHeatmapsFromServer();
         loadAnnotationsFromServer();

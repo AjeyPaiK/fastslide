@@ -243,6 +243,18 @@ def create_app(
                     return Response(content=data, media_type="image/png")
         raise HTTPException(status_code=404, detail="heatmap not found")
 
+    @app.get("/heatmap-colorbar.png")
+    def heatmap_colorbar(
+        cmap: str = heatmap_lib.DEFAULT_COLORMAP,
+        width: int = 160,
+        height: int = 24,
+    ) -> Response:
+        try:
+            data = heatmap_lib.colorbar_png(cmap, width=width, height=height)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return Response(content=data, media_type="image/png")
+
     @app.get("/tiles/{image}/{z}/{x}/{y}.{ext}")
     def tile(image: int, z: int, x: int, y: int, ext: str) -> Response:
         media_type = _MEDIA_TYPES.get(ext.lower())

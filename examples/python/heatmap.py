@@ -101,6 +101,31 @@ def colorize_png(png_path_str: str, cmap_name: str = DEFAULT_COLORMAP) -> bytes:
     return buffer.getvalue()
 
 
+@functools.lru_cache(maxsize=32)
+def colorbar_png(
+    cmap_name: str = DEFAULT_COLORMAP,
+    width: int = 160,
+    height: int = 24,
+) -> bytes:
+    """Returns a horizontal colorbar PNG using the same colormap LUT as :func:`colorize_png`.
+
+    The left edge corresponds to zero (LUT index 0) and the right edge to the
+    maximum intensity (LUT index 255), matching the heatmap value scale.
+    """
+    bar_w = max(32, min(int(width), 512))
+    bar_h = max(4, min(int(height), 128))
+    lut = _colormap_lut(cmap_name)
+    if bar_w == 1:
+        indices = np.array([0], dtype=np.uint8)
+    else:
+        indices = np.linspace(0, 255, bar_w, dtype=np.uint8)
+    strip = lut[indices]  # (W, 3)
+    rgb = np.repeat(strip[np.newaxis, :, :], bar_h, axis=0)
+    buffer = io.BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def meta_path_for(png_path: Path) -> Path:
     """Returns the JSON sidecar path for a rendered heatmap PNG."""
     return png_path.with_suffix(".json")
