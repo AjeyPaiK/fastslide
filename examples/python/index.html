@@ -326,7 +326,7 @@
       // the slide. The server returns each heatmap's pre-rendered PNG plus its
       // map extent (already in level-0 px with y negated), so the viewer just
       // draws one georeferenced image. Each has its own opacity (alpha) slider.
-      let heatmapGroups = []; // [{ name, extent, width, height, layer, visible, opacity }]
+      let heatmapGroups = []; // [{ name, title, extent, width, height, layer, visible, opacity }]
 
       // --- Annotations ---------------------------------------------------
       // GeoJSON coordinates are in level-0 slide pixels with the origin at the
@@ -840,10 +840,11 @@
 
           const header = document.createElement("div");
           header.className = "flex items-start justify-between gap-2";
+          const label = g.title || g.name;
           const title = document.createElement("div");
           title.className = "text-sm font-medium text-gray-200 truncate";
-          title.textContent = g.name;
-          title.title = g.name;
+          title.textContent = label;
+          title.title = label;
           const visible = document.createElement("input");
           visible.type = "checkbox";
           visible.checked = g.visible;
@@ -921,6 +922,7 @@
           const list = Array.isArray(data.heatmaps) ? data.heatmaps : [];
           heatmapGroups = list.map((h) => ({
             name: h.name,
+            title: h.title || h.name,
             extent: h.extent.map(Number),
             width: h.width,
             height: h.height,

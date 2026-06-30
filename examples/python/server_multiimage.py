@@ -60,6 +60,7 @@ import fastslide
 from fastslide.xyz_pyramid import XYZPyramid
 
 import heatmap as heatmap_lib
+import geojson_labels
 
 _HERE = Path(__file__).resolve().parent
 _INDEX_HTML = _HERE / "index.html"
@@ -349,6 +350,35 @@ def create_app(
             items.append({"name": name, "geojson": geojson})
         return JSONResponse({"annotations": items})
 
+    def _annotation_titles(slide: str) -> dict[str, str]:
+        """Maps annotation relative keys to GeoJSON display titles."""
+        if annotations_root is None:
+            return {}
+        titles: dict[str, str] = {}
+        for path in find_annotation_files(slide):
+            try:
+                geojson = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            label = geojson_labels.geojson_title(geojson)
+            if not label:
+                continue
+            try:
+                key = path.relative_to(annotations_root).with_suffix("").as_posix()
+            except ValueError:
+                key = path.stem
+            titles[key] = label
+        return titles
+
+    def _heatmap_display_title(heatmap_key: str, ann_titles: dict[str, str]) -> str | None:
+        """Looks up a heatmap's label from matching annotation GeoJSON."""
+        if heatmap_key in ann_titles:
+            return ann_titles[heatmap_key]
+        stem = Path(heatmap_key).name
+        if stem in ann_titles:
+            return ann_titles[stem]
+        return None
+
     def _heatmap_name(source: Path) -> str:
         try:
             return source.relative_to(heatmaps_root).with_suffix("").as_posix()
@@ -358,15 +388,23 @@ def create_app(
     @app.get("/heatmaps")
     def heatmaps(slide: str = Query(...)) -> JSONResponse:
         resolve_slide(slide)  # validate the slide reference (404 otherwise)
+        ann_titles = _annotation_titles(slide)
         items: list[dict[str, object]] = []
         for source in find_heatmap_files(slide):
             try:
                 _, meta = heatmap_lib.ensure_rendered(source)
             except (OSError, ValueError):
                 continue
+            hm_name = _heatmap_name(source)
+            title = (
+                heatmap_lib.meta_title(meta)
+                or _heatmap_display_title(hm_name, ann_titles)
+                or hm_name
+            )
             items.append(
                 {
-                    "name": _heatmap_name(source),
+                    "name": hm_name,
+                    "title": title,
                     "extent": heatmap_lib.map_extent(meta),
                     "width": meta["width"],
                     "height": meta["height"],

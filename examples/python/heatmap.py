@@ -149,6 +149,14 @@ def _grid_from_tsv(tsv_path: Path) -> np.ndarray:
     return grid
 
 
+def meta_title(meta: dict[str, Any]) -> str | None:
+    """Returns the optional human-readable label stored in heatmap metadata."""
+    title = meta.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return None
+
+
 def _write_png_and_meta(
     grid: np.ndarray,
     x_offset: int,
@@ -177,7 +185,15 @@ def _write_png_and_meta(
         "height": int(height),
         "max_value": max_value,
     }
-    meta_path_for(png_path).write_text(json.dumps(meta))
+    sidecar = meta_path_for(png_path)
+    if sidecar.is_file():
+        try:
+            prior = json.loads(sidecar.read_text())
+            if isinstance(prior.get("title"), str) and prior["title"].strip():
+                meta["title"] = prior["title"].strip()
+        except (OSError, ValueError):
+            pass
+    sidecar.write_text(json.dumps(meta))
     return meta
 
 

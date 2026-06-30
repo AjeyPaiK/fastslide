@@ -52,6 +52,7 @@ import fastslide
 from fastslide.xyz_pyramid import XYZPyramid
 
 import heatmap as heatmap_lib
+import geojson_labels
 
 _HERE = Path(__file__).resolve().parent
 _INDEX_HTML = _HERE / "index.html"
@@ -140,6 +141,49 @@ def create_app(
             }
         )
 
+    def _annotation_titles() -> dict[str, str]:
+        """Maps annotation keys to GeoJSON display titles."""
+        if annotations_file is None:
+            return {}
+        files: list[Path] = []
+        if annotations_file.is_dir():
+            for ext in _ANNOTATION_EXTENSIONS:
+                files.extend(p for p in annotations_file.rglob(f"*{ext}") if p.is_file())
+            files.sort()
+        elif annotations_file.is_file():
+            files = [annotations_file]
+        titles: dict[str, str] = {}
+        for path in files:
+            try:
+                geojson = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            label = geojson_labels.geojson_title(geojson)
+            if not label:
+                continue
+            if annotations_file.is_dir():
+                key = path.relative_to(annotations_file).with_suffix("").as_posix()
+            else:
+                key = path.stem
+            titles[key] = label
+        return titles
+
+    def _heatmap_key(source: Path) -> str:
+        if heatmaps_file is not None and heatmaps_file.is_dir():
+            try:
+                return source.relative_to(heatmaps_file).with_suffix("").as_posix()
+            except ValueError:
+                pass
+        return source.stem
+
+    def _heatmap_display_title(heatmap_key: str, ann_titles: dict[str, str]) -> str:
+        if heatmap_key in ann_titles:
+            return ann_titles[heatmap_key]
+        stem = Path(heatmap_key).name
+        if stem in ann_titles:
+            return ann_titles[stem]
+        return heatmap_key
+
     @app.get("/annotations")
     def annotations() -> JSONResponse:
         files: list[Path] = []
@@ -161,6 +205,7 @@ def create_app(
 
     @app.get("/heatmaps")
     def heatmaps() -> JSONResponse:
+        ann_titles = _annotation_titles()
         items: list[dict[str, object]] = []
         if heatmaps_file is not None:
             for source in _heatmap_sources(heatmaps_file):
@@ -168,9 +213,15 @@ def create_app(
                     _, meta = heatmap_lib.ensure_rendered(source)
                 except (OSError, ValueError):
                     continue
+                hm_name = _heatmap_key(source)
+                title = (
+                    heatmap_lib.meta_title(meta)
+                    or _heatmap_display_title(hm_name, ann_titles)
+                )
                 items.append(
                     {
-                        "name": source.stem,
+                        "name": hm_name,
+                        "title": title,
                         "extent": heatmap_lib.map_extent(meta),
                         "width": meta["width"],
                         "height": meta["height"],
@@ -183,7 +234,7 @@ def create_app(
     def heatmap_png(name: str, cmap: str = heatmap_lib.DEFAULT_COLORMAP) -> Response:
         if heatmaps_file is not None:
             for source in _heatmap_sources(heatmaps_file):
-                if source.stem == name:
+                if _heatmap_key(source) == name:
                     try:
                         png_path, _ = heatmap_lib.ensure_rendered(source)
                         data = heatmap_lib.colorize_png(str(png_path), cmap)
