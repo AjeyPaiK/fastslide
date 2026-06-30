@@ -29,13 +29,26 @@ Endpoints:
     GET /api/slides                        -> JSON list of discovered slides
     GET /viewer?slide=<relpath>            -> the OpenLayers viewer (index.html)
     GET /info?slide=<relpath>              -> slide + per-image metadata as JSON
+    GET /annotations?slide=<relpath>       -> GeoJSON annotations for the slide
     GET /tiles/{image}/{z}/{x}/{y}.{ext}?slide=<relpath>  -> a single tile
+
+Annotations are optional GeoJSON files whose coordinates are given in level-0
+slide pixels (origin top-left, y pointing down). Pass ``--annotations-dir`` to
+serve them. *All* GeoJSON files belonging to a slide are returned at once, so a
+slide can carry several annotation layers that the viewer toggles individually.
+For a slide ``sub/4104 T2.mrxs`` the server collects, under the annotations dir:
+
+- every ``*.json`` / ``*.geojson`` inside a per-slide subfolder named after the
+  slide stem (``<dir>/4104 T2/`` or ``<dir>/sub/4104 T2/``), and
+- flat files whose name is the slide stem or the stem followed by a separator,
+  e.g. ``4104 T2.json`` and ``4104 T2_tissue_foreground.json``.
 """
 
 from __future__ import annotations
 
 import argparse
 import functools
+import json
 import os
 from pathlib import Path
 
@@ -103,13 +116,36 @@ def _list_slides(root: Path, extensions: tuple[str, ...]) -> list[dict[str, obje
     return slides
 
 
-def create_app(root: str | Path, tile_size: int = 256, jpeg_quality: int = 85) -> FastAPI:
+_ANNOTATION_EXTENSIONS = (".json", ".geojson")
+# Characters that may join a slide stem to an annotation suffix in flat layouts,
+# e.g. ``4104 T2_tissue_foreground.json`` -> stem ``4104 T2`` + ``_`` + suffix.
+# Requiring a separator avoids matching a different slide whose stem merely
+# starts with this one (``4104 T2`` must not match ``4104 T21``).
+_STEM_SEPARATORS = ("_", "-", " ", ".", "(")
+
+
+def _collect_geojson(directory: Path) -> list[Path]:
+    """Returns every GeoJSON file under ``directory`` (recursively)."""
+    files: list[Path] = []
+    for ext in _ANNOTATION_EXTENSIONS:
+        files.extend(p for p in directory.rglob(f"*{ext}") if p.is_file())
+    return files
+
+
+def create_app(
+    root: str | Path,
+    tile_size: int = 256,
+    jpeg_quality: int = 85,
+    annotations_dir: str | Path | None = None,
+) -> FastAPI:
     """Builds the FastAPI app serving XYZ tiles for every slide under ``root``.
 
     Args:
         root: Directory to scan for supported slides (searched recursively).
         tile_size: Tile edge length in pixels.
         jpeg_quality: Quality used when encoding JPEG tiles.
+        annotations_dir: Optional directory holding per-slide GeoJSON files,
+            matched by the slide's file stem (and mirrored sub-path).
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
@@ -117,6 +153,10 @@ def create_app(root: str | Path, tile_size: int = 256, jpeg_quality: int = 85) -
     root_dir = Path(root).resolve()
     if not root_dir.is_dir():
         raise NotADirectoryError(f"not a directory: {root_dir}")
+
+    annotations_root = Path(annotations_dir).resolve() if annotations_dir else None
+    if annotations_root is not None and not annotations_root.is_dir():
+        raise NotADirectoryError(f"not a directory: {annotations_root}")
 
     extensions = _supported_extensions()
 
@@ -130,6 +170,48 @@ def create_app(root: str | Path, tile_size: int = 256, jpeg_quality: int = 85) -
         if not candidate.exists() or not _matches_extension(candidate.name, extensions):
             raise HTTPException(status_code=404, detail="slide not found")
         return candidate
+
+    def find_annotation_files(rel: str) -> list[Path]:
+        """Returns every GeoJSON annotation file belonging to a slide.
+
+        Two layouts are supported and combined: a per-slide subfolder named
+        after the slide stem (all GeoJSON inside it), and flat files whose name
+        is the slide stem (optionally followed by a separator and a suffix).
+        """
+        if annotations_root is None:
+            return []
+        rel_path = Path(rel)
+        stem = rel_path.stem
+        found: dict[Path, None] = {}
+
+        # 1) Per-slide subfolder holding all of that slide's annotation layers.
+        for subdir in (annotations_root / stem, annotations_root / rel_path.parent / stem):
+            if subdir.is_dir():
+                for f in _collect_geojson(subdir):
+                    found[f.resolve()] = None
+
+        # 2) Flat files matching the stem exactly or stem + separator + suffix.
+        for directory in (annotations_root, annotations_root / rel_path.parent):
+            if not directory.is_dir():
+                continue
+            for f in directory.iterdir():
+                if not f.is_file() or f.suffix.lower() not in _ANNOTATION_EXTENSIONS:
+                    continue
+                name = f.stem
+                if name == stem or (
+                    name.startswith(stem) and name[len(stem) : len(stem) + 1] in _STEM_SEPARATORS
+                ):
+                    found[f.resolve()] = None
+
+        # Guard against path traversal and return a stable, sorted list.
+        result: list[Path] = []
+        for resolved in found:
+            try:
+                resolved.relative_to(annotations_root)
+            except ValueError:
+                continue
+            result.append(resolved)
+        return sorted(result)
 
     # Cache the opened slide per relative path so repeated tile requests reuse
     # the same reader. The cached tuple keeps the FastSlide handle alive, which
@@ -181,6 +263,22 @@ def create_app(root: str | Path, tile_size: int = 256, jpeg_quality: int = 85) -
             }
         )
 
+    @app.get("/annotations")
+    def annotations(slide: str = Query(...)) -> JSONResponse:
+        resolve_slide(slide)  # validate the slide reference (404 otherwise)
+        items: list[dict[str, object]] = []
+        for path in find_annotation_files(slide):
+            try:
+                geojson = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            try:
+                name = path.relative_to(annotations_root).with_suffix("").as_posix()
+            except ValueError:
+                name = path.stem
+            items.append({"name": name, "geojson": geojson})
+        return JSONResponse({"annotations": items})
+
     @app.get("/tiles/{image}/{z}/{x}/{y}.{ext}")
     def tile(image: int, z: int, x: int, y: int, ext: str, slide: str = Query(...)) -> Response:
         media_type = _MEDIA_TYPES.get(ext.lower())
@@ -205,13 +303,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     parser.add_argument("--tile-size", type=int, default=256, help="Tile size in px (default: 256).")
     parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality 1-100 (default: 85).")
+    parser.add_argument(
+        "--annotations-dir",
+        default=None,
+        help="Directory of per-slide GeoJSON files (matched by slide stem).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """CLI entry point."""
     args = _parse_args()
-    app = create_app(args.root, tile_size=args.tile_size, jpeg_quality=args.jpeg_quality)
+    app = create_app(
+        args.root,
+        tile_size=args.tile_size,
+        jpeg_quality=args.jpeg_quality,
+        annotations_dir=args.annotations_dir,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 

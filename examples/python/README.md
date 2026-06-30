@@ -76,6 +76,46 @@ Options (both servers accept `--host`, `--port`, `--tile-size`, `--jpeg-quality`
 python server.py /path/to/slide.svs --host 0.0.0.0 --port 8000 --tile-size 256 --jpeg-quality 85
 ```
 
+## GeoJSON annotations (overlay)
+
+Both servers can overlay GeoJSON annotations on top of the slide. Coordinates
+must be in **level-0 slide pixels** (origin top-left, y pointing down) -- the
+same convention QuPath exports. A slide can carry **several annotation files at
+once**; each becomes its own layer that you toggle independently in the viewer.
+
+- `server.py` takes a file or folder: `--annotations /path/to/slide.json` or
+  `--annotations /path/to/folder` (every GeoJSON in the folder becomes a layer).
+- `server_multiimage.py` takes a folder: `--annotations-dir /path/to/annotations`.
+
+```bash
+python server_multiimage.py /path/to/slides --annotations-dir /path/to/annotations
+```
+
+For a slide `sub/2111 T2.mrxs`, the multi-image server collects, under the
+annotations dir:
+
+- **all** `*.json` / `*.geojson` inside a per-slide subfolder named after the
+  slide stem (`<dir>/2111 T2/` or `<dir>/sub/2111 T2/`), and
+- flat files whose name is the slide stem, or the stem followed by a separator
+  (`_ - . space (`) -- e.g. `2111 T2.json` and `2111 T2_tissue_foreground.json`
+  both match, but `2111 T21.json` does not.
+
+Geometry handling in the viewer:
+
+- `Point` / `MultiPoint` are drawn as **circles of a fixed physical diameter**
+  (in millimeters) centered on each point, outline only. The diameter is
+  adjustable in the Annotations panel; it is converted to pixels using the
+  slide's MPP, so points are skipped for slides with no physical scale.
+- `Polygon`, `MultiPolygon`, `LineString`, etc. are drawn as outlines with a
+  translucent fill.
+- Features are colored by their GeoJSON `classification.color` (`[r, g, b]`)
+  when present, otherwise by a palette keyed on `classification.name`. Only
+  point circles are labeled, since region layers can hold thousands of features.
+
+The Annotations panel in the sidebar has a master show/hide toggle, the circle
+diameter, a **per-layer checklist** to toggle each file on its own, and a picker
+to load one or more GeoJSON files directly from your machine.
+
 ## Endpoints
 
 `server.py` (single slide):
@@ -84,6 +124,7 @@ python server.py /path/to/slide.svs --host 0.0.0.0 --port 8000 --tile-size 256 -
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /`                                | The OpenLayers viewer (`index.html`).                                                                                                                  |
 | `GET /info`                            | Slide metadata as JSON: file name/format, `primary_index`, and per-image entries (dimensions, zoom range, tile size, native levels, MPP, resolutions). |
+| `GET /annotations`                     | Annotation layers as `{ "annotations": [ { "name", "geojson" }, ... ] }` (empty unless `--annotations` is set).                                         |
 | `GET /tiles/{image}/{z}/{x}/{y}.{ext}` | A single tile from image `image`; `ext` is `jpg`, `jpeg`, or `png`.                                                                                    |
 
 `server_multiimage.py` (folder): the slide is selected with a `?slide=<relpath>`
@@ -95,6 +136,7 @@ query parameter, where `<relpath>` is the path relative to the served folder.
 | `GET /api/slides`                                      | JSON: served root, supported extensions, and slide list. |
 | `GET /viewer?slide=<relpath>`                          | The OpenLayers viewer for one slide.                     |
 | `GET /info?slide=<relpath>`                            | Same payload as the single-slide `/info`.                |
+| `GET /annotations?slide=<relpath>`                     | All annotation layers for the slide as a named list.     |
 | `GET /tiles/{image}/{z}/{x}/{y}.{ext}?slide=<relpath>` | A single tile from a slide in the folder.                |
 
 Slides with multiple navigable images (e.g. an Olympus VSI navigator plus

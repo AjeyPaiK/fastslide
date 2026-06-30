@@ -235,6 +235,66 @@
               </div>
             </div>
           </div>
+
+          <div>
+            <h2 class="text-lg font-semibold text-primary-400 mb-4">
+              Annotations
+            </h2>
+            <div
+              class="space-y-4 bg-gray-900/50 p-4 rounded-xl border border-gray-700/50"
+            >
+              <label
+                class="flex items-center justify-between text-sm cursor-pointer"
+              >
+                <span class="text-gray-300">Show annotations</span>
+                <input
+                  id="annotation-toggle"
+                  type="checkbox"
+                  checked
+                  class="h-4 w-4 rounded border-gray-600 bg-gray-900 text-primary-500 focus:ring-primary-500"
+                />
+              </label>
+
+              <div class="flex items-center justify-between text-sm">
+                <span class="text-gray-500">Circle diameter (mm)</span>
+                <input
+                  id="annotation-diameter"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  value="2.10"
+                  class="w-24 rounded-lg bg-gray-900 border border-gray-700 text-gray-200 text-sm py-1 px-2 focus:border-primary-500 focus:ring-primary-500"
+                />
+              </div>
+
+              <div class="border-t border-gray-700/50 pt-3">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-xs font-medium uppercase tracking-wide text-gray-500"
+                    >Layers</span
+                  >
+                  <span class="text-xs text-gray-500" id="annotation-count"
+                    >0 layers, 0 features</span
+                  >
+                </div>
+                <div id="annotation-list" class="space-y-2 max-h-48 overflow-y-auto pr-1">
+                  <p class="text-xs text-gray-600">No annotation layers loaded.</p>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-xs text-gray-500 mb-1"
+                  >Load GeoJSON file(s)</label
+                >
+                <input
+                  id="annotation-file"
+                  type="file"
+                  multiple
+                  accept=".json,.geojson,application/json,application/geo+json"
+                  class="block w-full text-xs text-gray-400 file:mr-3 file:rounded-lg file:border-0 file:bg-primary-600 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-primary-700 cursor-pointer"
+                />
+              </div>
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -248,6 +308,320 @@
       let layer = null;
       let slideInfo = null;
       let currentImageIndex = 0;
+
+      // --- Annotations ---------------------------------------------------
+      // GeoJSON coordinates are in level-0 slide pixels with the origin at the
+      // top-left and y pointing down. The map projection uses the same x but a
+      // downward-negative y (extent [0, -height, width, 0]), so the only
+      // transform needed is y -> -y. Point geometries are drawn as circles of a
+      // fixed physical diameter (mm); other geometries are drawn as-is.
+      //
+      // Every annotation file for a slide becomes its own "group": a vector
+      // source/layer plus a visibility flag, so each can be toggled on its own.
+      const geojsonFormat = new ol.format.GeoJSON();
+      let annotationGroups = []; // [{ name, data, source, layer, visible }]
+      let pointDiameterMm = 2.1; // physical diameter of point circles, in mm
+      let annotationsVisible = true; // master toggle for all groups
+
+      const ANNOTATION_PALETTE = [
+        "#f87171",
+        "#fbbf24",
+        "#34d399",
+        "#60a5fa",
+        "#c084fc",
+        "#f472b6",
+        "#22d3ee",
+        "#a3e635",
+      ];
+      const classColors = {};
+
+      function colorForClass(name) {
+        const key = name || "__default__";
+        if (!(key in classColors)) {
+          const idx = Object.keys(classColors).length % ANNOTATION_PALETTE.length;
+          classColors[key] = ANNOTATION_PALETTE[idx];
+        }
+        return classColors[key];
+      }
+
+      function classNameOf(props) {
+        return props && props.classification && props.classification.name
+          ? props.classification.name
+          : null;
+      }
+
+      // Distinct classification names present in a GeoJSON object, for display
+      // in the sidebar panel (the names are not drawn on the image).
+      function classNamesOf(data) {
+        const names = [];
+        if (!data || !Array.isArray(data.features)) return names;
+        data.features.forEach((f) => {
+          const name = classNameOf(f.properties || {});
+          if (name && !names.includes(name)) names.push(name);
+        });
+        return names;
+      }
+
+      // Returns the [r, g, b] color for a feature: the GeoJSON
+      // classification.color when present, otherwise a palette color keyed by
+      // the classification name.
+      function rgbForFeature(props) {
+        const c = props && props.classification && props.classification.color;
+        if (Array.isArray(c) && c.length >= 3) {
+          return [c[0] | 0, c[1] | 0, c[2] | 0];
+        }
+        const hex = colorForClass(classNameOf(props));
+        const n = parseInt(hex.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+      }
+
+      function cssRgb(rgb, alpha) {
+        return alpha == null
+          ? `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`
+          : `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+      }
+
+      // Flip the y axis in-place for a flat coordinate array (works for any
+      // geometry dimensionality/stride).
+      function flipY(input, output, stride) {
+        output = output || input;
+        for (let i = 0; i < input.length; i += stride) {
+          output[i] = input[i];
+          output[i + 1] = -input[i + 1];
+          for (let k = 2; k < stride; k++) output[i + k] = input[i + k];
+        }
+        return output;
+      }
+
+      function makeCircleFeature(coord, radius, props) {
+        const feature = new ol.Feature(
+          new ol.geom.Circle([coord[0], -coord[1]], radius)
+        );
+        feature.setProperties(props || {});
+        return feature;
+      }
+
+      function annotationStyle(feature) {
+        const props = feature.getProperties();
+        const rgb = rgbForFeature(props);
+        const geom = feature.getGeometry();
+        const isCircle = geom && geom.getType() === "Circle";
+        // No on-image text labels: classification names are shown only in the
+        // sidebar Annotations panel. Point circles are outline-only; region
+        // geometries keep a faint translucent fill.
+        return new ol.style.Style({
+          stroke: new ol.style.Stroke({ color: cssRgb(rgb), width: 2 }),
+          fill: isCircle
+            ? undefined
+            : new ol.style.Fill({ color: cssRgb(rgb, 0.15) }),
+        });
+      }
+
+      function updateAnnotationCount() {
+        const el = document.getElementById("annotation-count");
+        if (!el) return;
+        let n = 0;
+        annotationGroups.forEach((g) => (n += g.source.getFeatures().length));
+        const layers = annotationGroups.length;
+        el.textContent = `${layers} layer${layers === 1 ? "" : "s"}, ${n} feature${
+          n === 1 ? "" : "s"
+        }`;
+      }
+
+      // Mean microns-per-pixel of the current image, or null if the slide has
+      // no physical scale. Map units are level-0 pixels, so converting a
+      // physical length to map units uses this scale directly.
+      function currentImageMpp() {
+        if (!slideInfo || !slideInfo.images) return null;
+        const image = slideInfo.images[currentImageIndex];
+        if (!image || !image.mpp) return null;
+        const [mx, my] = image.mpp;
+        return (mx + my) / 2;
+      }
+
+      // Converts a physical diameter (mm) to a circle radius in level-0 pixels
+      // using the current image's MPP. Returns null when the scale is unknown.
+      function pointRadiusPixels() {
+        const mpp = currentImageMpp(); // microns per pixel
+        if (!mpp || mpp <= 0) return null;
+        const diameterMicrons = pointDiameterMm * 1000;
+        return diameterMicrons / mpp / 2;
+      }
+
+      // Builds OpenLayers features from one GeoJSON object, converting points to
+      // circles of the given radius (px) and flipping y for every geometry.
+      function buildFeatures(data, radius) {
+        const out = [];
+        if (!data || !Array.isArray(data.features)) return out;
+        data.features.forEach((feature) => {
+          const geom = feature.geometry;
+          if (!geom) return;
+          const props = Object.assign({}, feature.properties || {});
+          if (geom.type === "Point" || geom.type === "MultiPoint") {
+            // Point circles need a physical scale; skip them if MPP is unknown.
+            if (radius === null) return;
+            const coords =
+              geom.type === "Point" ? [geom.coordinates] : geom.coordinates;
+            coords.forEach((c) => out.push(makeCircleFeature(c, radius, props)));
+          } else {
+            let olGeom;
+            try {
+              olGeom = geojsonFormat.readGeometry(geom);
+            } catch (err) {
+              return;
+            }
+            olGeom.applyTransform(flipY);
+            const olFeature = new ol.Feature(olGeom);
+            olFeature.setProperties(props);
+            out.push(olFeature);
+          }
+        });
+        return out;
+      }
+
+      // Recompute features for every group (e.g. after the diameter or image,
+      // and therefore the MPP, changes).
+      function rebuildAllAnnotationFeatures() {
+        const radius = pointRadiusPixels();
+        annotationGroups.forEach((g) => {
+          g.source.clear();
+          g.source.addFeatures(buildFeatures(g.data, radius));
+        });
+        updateAnnotationCount();
+      }
+
+      // (Re)create a vector layer per group on the current map. Layers are
+      // rebuilt fresh because the map itself is recreated on image/format
+      // changes, but the underlying sources persist.
+      function syncAnnotationLayers() {
+        if (!map) return;
+        annotationGroups.forEach((g) => {
+          if (g.layer) {
+            try {
+              map.removeLayer(g.layer);
+            } catch (err) {
+              /* layer not on this map */
+            }
+          }
+          g.layer = new ol.layer.Vector({
+            source: g.source,
+            style: annotationStyle,
+            visible: annotationsVisible && g.visible,
+          });
+          map.addLayer(g.layer);
+        });
+      }
+
+      function setAnnotationsVisible(visible) {
+        annotationsVisible = visible;
+        annotationGroups.forEach((g) => {
+          if (g.layer) g.layer.setVisible(annotationsVisible && g.visible);
+        });
+      }
+
+      // Renders the per-layer visibility checklist in the sidebar.
+      function renderAnnotationList() {
+        const container = document.getElementById("annotation-list");
+        if (!container) return;
+        container.innerHTML = "";
+        if (annotationGroups.length === 0) {
+          container.innerHTML =
+            '<p class="text-xs text-gray-600">No annotation layers loaded.</p>';
+          return;
+        }
+        annotationGroups.forEach((g) => {
+          const row = document.createElement("label");
+          row.className =
+            "flex items-start justify-between gap-2 text-sm cursor-pointer";
+
+          const labels = document.createElement("div");
+          labels.className = "min-w-0";
+          const name = document.createElement("div");
+          name.className = "text-gray-300 truncate";
+          name.textContent = g.name;
+          name.title = g.name;
+          labels.appendChild(name);
+          const classes = classNamesOf(g.data);
+          if (classes.length) {
+            const sub = document.createElement("div");
+            sub.className = "text-xs text-gray-500 truncate";
+            sub.textContent = classes.join(", ");
+            sub.title = classes.join(", ");
+            labels.appendChild(sub);
+          }
+
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = g.visible;
+          checkbox.className =
+            "mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-900 text-primary-500 focus:ring-primary-500 shrink-0";
+          checkbox.addEventListener("change", () => {
+            g.visible = checkbox.checked;
+            if (g.layer) g.layer.setVisible(annotationsVisible && g.visible);
+          });
+
+          row.appendChild(labels);
+          row.appendChild(checkbox);
+          container.appendChild(row);
+        });
+      }
+
+      // Appends new annotation groups, builds their features, wires up layers,
+      // and refreshes the sidebar list.
+      function addAnnotationGroups(entries) {
+        entries.forEach((entry) => {
+          annotationGroups.push({
+            name: entry.name,
+            data: entry.data,
+            source: new ol.source.Vector(),
+            layer: null,
+            visible: true,
+          });
+        });
+        rebuildAllAnnotationFeatures();
+        syncAnnotationLayers();
+        renderAnnotationList();
+      }
+
+      async function loadAnnotationsFromServer() {
+        try {
+          const resp = await fetch(withSlide("/annotations"));
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const list = Array.isArray(data.annotations) ? data.annotations : [];
+          addAnnotationGroups(
+            list.map((a) => ({ name: a.name, data: a.geojson }))
+          );
+        } catch (err) {
+          // No annotations available; leave the overlay empty.
+        }
+      }
+
+      // Loads one or more local GeoJSON files, each as its own layer.
+      function loadAnnotationsFromFiles(fileList) {
+        const files = Array.from(fileList);
+        let pending = files.length;
+        const entries = [];
+        const done = () => {
+          if (--pending === 0 && entries.length) addAnnotationGroups(entries);
+        };
+        files.forEach((file) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            try {
+              entries.push({
+                name: file.name.replace(/\.(geo)?json$/i, ""),
+                data: JSON.parse(reader.result),
+              });
+            } catch (err) {
+              alert(`Could not parse ${file.name} as GeoJSON.`);
+            }
+            done();
+          };
+          reader.onerror = done;
+          reader.readAsText(file);
+        });
+      }
 
       // When served by the multi-image (folder) server, the slide to view is
       // passed as a ?slide=<relpath> query param that must be forwarded to the
@@ -370,6 +744,9 @@
         });
 
         map.getView().fit(extent, { padding: [20, 20, 20, 20] });
+
+        // Re-attach annotation layers; the map was just recreated.
+        syncAnnotationLayers();
       }
 
       function populateImageSwitcher() {
@@ -421,6 +798,8 @@
           currentImage(),
           document.getElementById("format-select").value
         );
+        // Point circle sizes depend on the image's MPP, so rebuild on switch.
+        rebuildAllAnnotationFeatures();
       }
 
       async function init() {
@@ -439,10 +818,37 @@
         populateImageSwitcher();
         selectImage(currentImageIndex);
 
+        loadAnnotationsFromServer();
+
         document
           .getElementById("format-select")
           .addEventListener("change", (e) => {
             createMap(currentImage(), e.target.value);
+          });
+
+        document
+          .getElementById("annotation-toggle")
+          .addEventListener("change", (e) => {
+            setAnnotationsVisible(e.target.checked);
+          });
+
+        document
+          .getElementById("annotation-diameter")
+          .addEventListener("change", (e) => {
+            const value = parseFloat(e.target.value);
+            if (value > 0) {
+              pointDiameterMm = value;
+              rebuildAllAnnotationFeatures();
+            }
+          });
+
+        document
+          .getElementById("annotation-file")
+          .addEventListener("change", (e) => {
+            if (e.target.files && e.target.files.length) {
+              loadAnnotationsFromFiles(e.target.files);
+            }
+            e.target.value = ""; // allow re-selecting the same file(s)
           });
 
         document

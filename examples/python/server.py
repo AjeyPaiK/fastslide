@@ -26,12 +26,19 @@ Then open http://127.0.0.1:8000 in a browser.
 Endpoints:
     GET /                                  -> the OpenLayers viewer (index.html)
     GET /info                              -> slide + per-image metadata as JSON
+    GET /annotations                       -> GeoJSON annotations (if configured)
     GET /tiles/{image}/{z}/{x}/{y}.{ext}   -> a single tile (ext: jpg | jpeg | png)
+
+Annotations are optional GeoJSON whose coordinates are in level-0 slide pixels
+(origin top-left, y pointing down). ``--annotations`` may point to a single file
+or to a folder; when it is a folder, *every* ``*.json`` / ``*.geojson`` inside
+is served as a separate, individually toggleable layer.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import uvicorn
@@ -50,19 +57,29 @@ _MEDIA_TYPES = {
     "png": "image/png",
 }
 
+_ANNOTATION_EXTENSIONS = (".json", ".geojson")
 
-def create_app(slide_path: str | Path, tile_size: int = 256, jpeg_quality: int = 85) -> FastAPI:
+
+def create_app(
+    slide_path: str | Path,
+    tile_size: int = 256,
+    jpeg_quality: int = 85,
+    annotations_path: str | Path | None = None,
+) -> FastAPI:
     """Builds the FastAPI app serving XYZ tiles for a single slide.
 
     Args:
         slide_path: Path to the whole-slide image to serve.
         tile_size: Tile edge length in pixels.
         jpeg_quality: Quality used when encoding JPEG tiles.
+        annotations_path: Optional path to a GeoJSON file with annotations in
+            level-0 slide pixel coordinates.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
     """
     slide = fastslide.FastSlide.from_file_path(str(slide_path))
+    annotations_file = Path(annotations_path).resolve() if annotations_path else None
 
     # One XYZ pyramid per navigable image in the file. Most slides expose a
     # single image; some (e.g. Olympus VSI) expose a navigator plus one or more
@@ -93,6 +110,25 @@ def create_app(slide_path: str | Path, tile_size: int = 256, jpeg_quality: int =
             }
         )
 
+    @app.get("/annotations")
+    def annotations() -> JSONResponse:
+        files: list[Path] = []
+        if annotations_file is not None:
+            if annotations_file.is_dir():
+                for ext in _ANNOTATION_EXTENSIONS:
+                    files.extend(p for p in annotations_file.rglob(f"*{ext}") if p.is_file())
+                files.sort()
+            elif annotations_file.is_file():
+                files = [annotations_file]
+        items: list[dict[str, object]] = []
+        for path in files:
+            try:
+                geojson = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            items.append({"name": path.stem, "geojson": geojson})
+        return JSONResponse({"annotations": items})
+
     @app.get("/tiles/{image}/{z}/{x}/{y}.{ext}")
     def tile(image: int, z: int, x: int, y: int, ext: str) -> Response:
         media_type = _MEDIA_TYPES.get(ext.lower())
@@ -116,13 +152,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     parser.add_argument("--tile-size", type=int, default=256, help="Tile size in px (default: 256).")
     parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality 1-100 (default: 85).")
+    parser.add_argument(
+        "--annotations",
+        default=None,
+        help="GeoJSON file, or a folder of GeoJSON files, with level-0 annotations.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """CLI entry point."""
     args = _parse_args()
-    app = create_app(args.slide, tile_size=args.tile_size, jpeg_quality=args.jpeg_quality)
+    app = create_app(
+        args.slide,
+        tile_size=args.tile_size,
+        jpeg_quality=args.jpeg_quality,
+        annotations_path=args.annotations,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 
