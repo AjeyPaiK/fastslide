@@ -255,18 +255,6 @@
                 />
               </label>
 
-              <div class="flex items-center justify-between text-sm">
-                <span class="text-gray-500">Circle diameter (mm)</span>
-                <input
-                  id="annotation-diameter"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
-                  value="2.10"
-                  class="w-24 rounded-lg bg-gray-900 border border-gray-700 text-gray-200 text-sm py-1 px-2 focus:border-primary-500 focus:ring-primary-500"
-                />
-              </div>
-
               <div class="border-t border-gray-700/50 pt-3">
                 <div class="flex items-center justify-between mb-2">
                   <span class="text-xs font-medium uppercase tracking-wide text-gray-500"
@@ -276,7 +264,7 @@
                     >0 layers, 0 features</span
                   >
                 </div>
-                <div id="annotation-list" class="space-y-2 max-h-48 overflow-y-auto pr-1">
+                <div id="annotation-list" class="space-y-3 max-h-96 overflow-y-auto pr-1">
                   <p class="text-xs text-gray-600">No annotation layers loaded.</p>
                 </div>
               </div>
@@ -381,6 +369,34 @@
           : `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
       }
 
+      function hexToRgb(hex) {
+        const n = parseInt(hex.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+      }
+
+      function rgbToHex(rgb) {
+        const h = (v) =>
+          Math.max(0, Math.min(255, v | 0)).toString(16).padStart(2, "0");
+        return `#${h(rgb[0])}${h(rgb[1])}${h(rgb[2])}`;
+      }
+
+      function dataHasPoints(data) {
+        if (!data || !Array.isArray(data.features)) return false;
+        return data.features.some((f) => {
+          const t = f.geometry && f.geometry.type;
+          return t === "Point" || t === "MultiPoint";
+        });
+      }
+
+      // The color shown in a layer's color picker: the per-layer override if
+      // set, else the color of its first feature (classification color/palette).
+      function groupColorHex(group) {
+        if (group.colorOverride) return group.colorOverride;
+        const feats = group.source.getFeatures();
+        const props = feats.length ? feats[0].getProperties() : {};
+        return rgbToHex(rgbForFeature(props));
+      }
+
       // Flip the y axis in-place for a flat coordinate array (works for any
       // geometry dimensionality/stride).
       function flipY(input, output, stride) {
@@ -401,20 +417,27 @@
         return feature;
       }
 
-      function annotationStyle(feature) {
-        const props = feature.getProperties();
-        const rgb = rgbForFeature(props);
-        const geom = feature.getGeometry();
-        const isCircle = geom && geom.getType() === "Circle";
-        // No on-image text labels: classification names are shown only in the
-        // sidebar Annotations panel. Point circles are outline-only; region
-        // geometries keep a faint translucent fill.
-        return new ol.style.Style({
-          stroke: new ol.style.Stroke({ color: cssRgb(rgb), width: 2 }),
-          fill: isCircle
-            ? undefined
-            : new ol.style.Fill({ color: cssRgb(rgb, 0.15) }),
-        });
+      // Builds a style function bound to one layer/group, so the layer's own
+      // color and outline width are applied. No on-image text labels are drawn:
+      // classification names are shown only in the sidebar panel. Point circles
+      // are outline-only; region geometries keep a faint translucent fill.
+      function makeGroupStyle(group) {
+        return function (feature) {
+          const geom = feature.getGeometry();
+          const isCircle = geom && geom.getType() === "Circle";
+          const rgb = group.colorOverride
+            ? hexToRgb(group.colorOverride)
+            : rgbForFeature(feature.getProperties());
+          return new ol.style.Style({
+            stroke: new ol.style.Stroke({
+              color: cssRgb(rgb),
+              width: group.strokeWidth,
+            }),
+            fill: isCircle
+              ? undefined
+              : new ol.style.Fill({ color: cssRgb(rgb, 0.15) }),
+          });
+        };
       }
 
       function updateAnnotationCount() {
@@ -441,11 +464,10 @@
 
       // Converts a physical diameter (mm) to a circle radius in level-0 pixels
       // using the current image's MPP. Returns null when the scale is unknown.
-      function pointRadiusPixels() {
+      function pointRadiusForMm(mm) {
         const mpp = currentImageMpp(); // microns per pixel
-        if (!mpp || mpp <= 0) return null;
-        const diameterMicrons = pointDiameterMm * 1000;
-        return diameterMicrons / mpp / 2;
+        if (!mpp || mpp <= 0 || !(mm > 0)) return null;
+        return (mm * 1000) / mpp / 2;
       }
 
       // Builds OpenLayers features from one GeoJSON object, converting points to
@@ -479,13 +501,20 @@
         return out;
       }
 
-      // Recompute features for every group (e.g. after the diameter or image,
-      // and therefore the MPP, changes).
+      // Recompute the features of a single group using its own circle diameter.
+      function rebuildGroupFeatures(group) {
+        const radius = pointRadiusForMm(group.diameterMm);
+        group.source.clear();
+        group.source.addFeatures(buildFeatures(group.data, radius));
+        updateAnnotationCount();
+      }
+
+      // Recompute features for every group (e.g. when the image, and therefore
+      // the MPP, changes).
       function rebuildAllAnnotationFeatures() {
-        const radius = pointRadiusPixels();
         annotationGroups.forEach((g) => {
           g.source.clear();
-          g.source.addFeatures(buildFeatures(g.data, radius));
+          g.source.addFeatures(buildFeatures(g.data, pointRadiusForMm(g.diameterMm)));
         });
         updateAnnotationCount();
       }
@@ -505,8 +534,9 @@
           }
           g.layer = new ol.layer.Vector({
             source: g.source,
-            style: annotationStyle,
+            style: makeGroupStyle(g),
             visible: annotationsVisible && g.visible,
+            opacity: g.opacity,
           });
           map.addLayer(g.layer);
         });
@@ -519,7 +549,20 @@
         });
       }
 
-      // Renders the per-layer visibility checklist in the sidebar.
+      // Small labeled control wrapper used by the per-layer customization grid.
+      function controlField(labelText, inputEl) {
+        const wrap = document.createElement("label");
+        wrap.className = "flex flex-col gap-1 text-xs text-gray-500";
+        const span = document.createElement("span");
+        span.textContent = labelText;
+        wrap.appendChild(span);
+        wrap.appendChild(inputEl);
+        return wrap;
+      }
+
+      // Renders each annotation layer with its name and its own customization
+      // controls (color, outline width, opacity, and circle diameter for point
+      // layers) directly beneath it.
       function renderAnnotationList() {
         const container = document.getElementById("annotation-list");
         if (!container) return;
@@ -529,40 +572,102 @@
             '<p class="text-xs text-gray-600">No annotation layers loaded.</p>';
           return;
         }
+
         annotationGroups.forEach((g) => {
-          const row = document.createElement("label");
-          row.className =
-            "flex items-start justify-between gap-2 text-sm cursor-pointer";
+          const card = document.createElement("div");
+          card.className =
+            "rounded-lg border border-gray-700/60 bg-gray-900/40 p-3 space-y-3";
 
-          const labels = document.createElement("div");
-          labels.className = "min-w-0";
-          const name = document.createElement("div");
-          name.className = "text-gray-300 truncate";
-          name.textContent = g.name;
-          name.title = g.name;
-          labels.appendChild(name);
+          // Header: classification name(s) (fall back to file name) + visibility.
+          const header = document.createElement("div");
+          header.className = "flex items-start justify-between gap-2";
           const classes = classNamesOf(g.data);
-          if (classes.length) {
-            const sub = document.createElement("div");
-            sub.className = "text-xs text-gray-500 truncate";
-            sub.textContent = classes.join(", ");
-            sub.title = classes.join(", ");
-            labels.appendChild(sub);
-          }
-
-          const checkbox = document.createElement("input");
-          checkbox.type = "checkbox";
-          checkbox.checked = g.visible;
-          checkbox.className =
-            "mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-900 text-primary-500 focus:ring-primary-500 shrink-0";
-          checkbox.addEventListener("change", () => {
-            g.visible = checkbox.checked;
+          const label = classes.length ? classes.join(", ") : g.name;
+          const title = document.createElement("div");
+          title.className = "text-sm font-medium text-gray-200 truncate";
+          title.textContent = label;
+          title.title = label;
+          const visible = document.createElement("input");
+          visible.type = "checkbox";
+          visible.checked = g.visible;
+          visible.title = "Show this layer";
+          visible.className =
+            "mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-900 text-primary-500 focus:ring-primary-500 shrink-0 cursor-pointer";
+          visible.addEventListener("change", () => {
+            g.visible = visible.checked;
             if (g.layer) g.layer.setVisible(annotationsVisible && g.visible);
           });
+          header.appendChild(title);
+          header.appendChild(visible);
+          card.appendChild(header);
 
-          row.appendChild(labels);
-          row.appendChild(checkbox);
-          container.appendChild(row);
+          // Customization grid.
+          const grid = document.createElement("div");
+          grid.className = "grid grid-cols-2 gap-x-3 gap-y-2";
+
+          const inputBase =
+            "rounded-md bg-gray-900 border border-gray-700 text-gray-200 text-xs focus:border-primary-500 focus:ring-primary-500";
+
+          // Color.
+          const color = document.createElement("input");
+          color.type = "color";
+          color.value = groupColorHex(g);
+          color.className = "h-7 w-full rounded-md bg-gray-900 border border-gray-700 cursor-pointer";
+          color.addEventListener("input", () => {
+            g.colorOverride = color.value;
+            if (g.layer) g.layer.setStyle(makeGroupStyle(g));
+          });
+          grid.appendChild(controlField("Color", color));
+
+          // Outline width (px).
+          const width = document.createElement("input");
+          width.type = "number";
+          width.min = "0.5";
+          width.step = "0.5";
+          width.value = String(g.strokeWidth);
+          width.className = inputBase + " py-1 px-2";
+          width.addEventListener("change", () => {
+            const v = parseFloat(width.value);
+            if (v > 0) {
+              g.strokeWidth = v;
+              if (g.layer) g.layer.setStyle(makeGroupStyle(g));
+            }
+          });
+          grid.appendChild(controlField("Outline (px)", width));
+
+          // Opacity (0-100%).
+          const opacity = document.createElement("input");
+          opacity.type = "range";
+          opacity.min = "0";
+          opacity.max = "100";
+          opacity.value = String(Math.round(g.opacity * 100));
+          opacity.className = "w-full accent-primary-500 cursor-pointer";
+          opacity.addEventListener("input", () => {
+            g.opacity = parseInt(opacity.value, 10) / 100;
+            if (g.layer) g.layer.setOpacity(g.opacity);
+          });
+          grid.appendChild(controlField("Opacity", opacity));
+
+          // Circle diameter (mm) -- only for layers that contain points.
+          if (g.hasPoints) {
+            const diameter = document.createElement("input");
+            diameter.type = "number";
+            diameter.min = "0.01";
+            diameter.step = "0.01";
+            diameter.value = String(g.diameterMm);
+            diameter.className = inputBase + " py-1 px-2";
+            diameter.addEventListener("change", () => {
+              const v = parseFloat(diameter.value);
+              if (v > 0) {
+                g.diameterMm = v;
+                rebuildGroupFeatures(g);
+              }
+            });
+            grid.appendChild(controlField("Diameter (mm)", diameter));
+          }
+
+          card.appendChild(grid);
+          container.appendChild(card);
         });
       }
 
@@ -576,6 +681,12 @@
             source: new ol.source.Vector(),
             layer: null,
             visible: true,
+            // Per-layer customization (editable in the sidebar):
+            hasPoints: dataHasPoints(entry.data),
+            colorOverride: null, // hex string; null = use feature/class color
+            strokeWidth: 2,
+            opacity: 1,
+            diameterMm: pointDiameterMm, // circle diameter for point geometries
           });
         });
         rebuildAllAnnotationFeatures();
@@ -830,16 +941,6 @@
           .getElementById("annotation-toggle")
           .addEventListener("change", (e) => {
             setAnnotationsVisible(e.target.checked);
-          });
-
-        document
-          .getElementById("annotation-diameter")
-          .addEventListener("change", (e) => {
-            const value = parseFloat(e.target.value);
-            if (value > 0) {
-              pointDiameterMm = value;
-              rebuildAllAnnotationFeatures();
-            }
           });
 
         document

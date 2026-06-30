@@ -112,9 +112,11 @@ Geometry handling in the viewer:
   when present, otherwise by a palette keyed on `classification.name`. Only
   point circles are labeled, since region layers can hold thousands of features.
 
-The Annotations panel in the sidebar has a master show/hide toggle, the circle
-diameter, a **per-layer checklist** to toggle each file on its own, and a picker
-to load one or more GeoJSON files directly from your machine.
+The Annotations panel in the sidebar has a master show/hide toggle and a picker
+to load one or more GeoJSON files directly from your machine. Each layer is
+listed by its classification name (falling back to the file name) with its own
+controls shown underneath: visibility, color, outline width, opacity, and -- for
+layers containing points -- the circle diameter (mm).
 
 ## Endpoints
 
