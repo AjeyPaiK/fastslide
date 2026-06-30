@@ -283,6 +283,28 @@
               </div>
             </div>
           </div>
+
+          <div>
+            <h2 class="text-lg font-semibold text-primary-400 mb-4">Heatmaps</h2>
+            <div
+              class="space-y-3 bg-gray-900/50 p-4 rounded-xl border border-gray-700/50"
+            >
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-medium uppercase tracking-wide text-gray-500"
+                  >Overlays</span
+                >
+                <span class="text-xs text-gray-500" id="heatmap-count"
+                  >0 heatmaps</span
+                >
+              </div>
+              <div
+                id="heatmap-list"
+                class="space-y-3 max-h-72 overflow-y-auto pr-1"
+              >
+                <p class="text-xs text-gray-600">No heatmaps loaded.</p>
+              </div>
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -296,6 +318,15 @@
       let layer = null;
       let slideInfo = null;
       let currentImageIndex = 0;
+      // The current image's pixel projection, needed to georeference heatmaps.
+      let currentProjection = null;
+
+      // --- Heatmaps ------------------------------------------------------
+      // A heatmap is a low-resolution intensity image overlaid on a region of
+      // the slide. The server returns each heatmap's pre-rendered PNG plus its
+      // map extent (already in level-0 px with y negated), so the viewer just
+      // draws one georeferenced image. Each has its own opacity (alpha) slider.
+      let heatmapGroups = []; // [{ name, extent, width, height, layer, visible, opacity }]
 
       // --- Annotations ---------------------------------------------------
       // GeoJSON coordinates are in level-0 slide pixels with the origin at the
@@ -537,6 +568,7 @@
             style: makeGroupStyle(g),
             visible: annotationsVisible && g.visible,
             opacity: g.opacity,
+            zIndex: 10, // annotations render above heatmaps
           });
           map.addLayer(g.layer);
         });
@@ -734,6 +766,176 @@
         });
       }
 
+      // --- Heatmap overlays ----------------------------------------------
+      // Standard colormaps offered for heatmaps (rendered server-side).
+      const HEATMAP_COLORMAPS = [
+        "jet",
+        "turbo",
+        "viridis",
+        "inferno",
+        "magma",
+        "plasma",
+        "hot",
+        "gray",
+      ];
+
+      function heatmapImageUrl(name, cmap) {
+        return withSlide(
+          "/heatmap.png?name=" +
+            encodeURIComponent(name) +
+            "&cmap=" +
+            encodeURIComponent(cmap || "jet")
+        );
+      }
+
+      function updateHeatmapCount() {
+        const el = document.getElementById("heatmap-count");
+        if (!el) return;
+        const n = heatmapGroups.length;
+        el.textContent = `${n} heatmap${n === 1 ? "" : "s"}`;
+      }
+
+      // (Re)create the image layer for each heatmap on the current map, using
+      // the current image's projection for georeferencing.
+      function syncHeatmapLayers() {
+        if (!map || !currentProjection) return;
+        heatmapGroups.forEach((g) => {
+          if (g.layer) {
+            try {
+              map.removeLayer(g.layer);
+            } catch (err) {
+              /* layer not on this map */
+            }
+          }
+          g.layer = new ol.layer.Image({
+            source: new ol.source.ImageStatic({
+              url: heatmapImageUrl(g.name, g.colormap),
+              imageExtent: g.extent,
+              projection: currentProjection,
+              interpolate: false, // crisp cells, no smoothing
+            }),
+            opacity: g.opacity,
+            visible: g.visible,
+            zIndex: 5, // below annotation layers (zIndex 10), above tiles
+          });
+          map.addLayer(g.layer);
+        });
+      }
+
+      // Renders each heatmap with a visibility toggle and an alpha slider.
+      function renderHeatmapList() {
+        const container = document.getElementById("heatmap-list");
+        if (!container) return;
+        container.innerHTML = "";
+        updateHeatmapCount();
+        if (heatmapGroups.length === 0) {
+          container.innerHTML =
+            '<p class="text-xs text-gray-600">No heatmaps loaded.</p>';
+          return;
+        }
+        heatmapGroups.forEach((g) => {
+          const card = document.createElement("div");
+          card.className =
+            "rounded-lg border border-gray-700/60 bg-gray-900/40 p-3 space-y-2";
+
+          const header = document.createElement("div");
+          header.className = "flex items-start justify-between gap-2";
+          const title = document.createElement("div");
+          title.className = "text-sm font-medium text-gray-200 truncate";
+          title.textContent = g.name;
+          title.title = g.name;
+          const visible = document.createElement("input");
+          visible.type = "checkbox";
+          visible.checked = g.visible;
+          visible.title = "Show this heatmap";
+          visible.className =
+            "mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-900 text-primary-500 focus:ring-primary-500 shrink-0 cursor-pointer";
+          visible.addEventListener("change", () => {
+            g.visible = visible.checked;
+            if (g.layer) g.layer.setVisible(g.visible);
+          });
+          header.appendChild(title);
+          header.appendChild(visible);
+          card.appendChild(header);
+
+          const field = document.createElement("label");
+          field.className = "flex items-center gap-2 text-xs text-gray-500";
+          const span = document.createElement("span");
+          span.textContent = "Alpha";
+          const alpha = document.createElement("input");
+          alpha.type = "range";
+          alpha.min = "0";
+          alpha.max = "100";
+          alpha.value = String(Math.round(g.opacity * 100));
+          alpha.className = "w-full accent-primary-500 cursor-pointer";
+          alpha.addEventListener("input", () => {
+            g.opacity = parseInt(alpha.value, 10) / 100;
+            if (g.layer) g.layer.setOpacity(g.opacity);
+          });
+          field.appendChild(span);
+          field.appendChild(alpha);
+          card.appendChild(field);
+
+          const cmapField = document.createElement("label");
+          cmapField.className =
+            "flex items-center gap-2 text-xs text-gray-500";
+          const cmapSpan = document.createElement("span");
+          cmapSpan.textContent = "Colormap";
+          const cmapSelect = document.createElement("select");
+          cmapSelect.className =
+            "flex-1 rounded-md border border-gray-700 bg-gray-900 px-2 py-1 text-xs text-gray-200 focus:ring-primary-500 cursor-pointer";
+          HEATMAP_COLORMAPS.forEach((name) => {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            if (name === g.colormap) opt.selected = true;
+            cmapSelect.appendChild(opt);
+          });
+          cmapSelect.addEventListener("change", () => {
+            g.colormap = cmapSelect.value;
+            // Re-fetch the heatmap image rendered with the new colormap.
+            if (g.layer) {
+              g.layer.setSource(
+                new ol.source.ImageStatic({
+                  url: heatmapImageUrl(g.name, g.colormap),
+                  imageExtent: g.extent,
+                  projection: currentProjection,
+                  interpolate: false,
+                })
+              );
+            }
+          });
+          cmapField.appendChild(cmapSpan);
+          cmapField.appendChild(cmapSelect);
+          card.appendChild(cmapField);
+
+          container.appendChild(card);
+        });
+      }
+
+      async function loadHeatmapsFromServer() {
+        try {
+          const resp = await fetch(withSlide("/heatmaps"));
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const list = Array.isArray(data.heatmaps) ? data.heatmaps : [];
+          heatmapGroups = list.map((h) => ({
+            name: h.name,
+            extent: h.extent.map(Number),
+            width: h.width,
+            height: h.height,
+            layer: null,
+            visible: true,
+            opacity: 0.6,
+            colormap: "jet",
+          }));
+          syncHeatmapLayers();
+          renderHeatmapList();
+        } catch (err) {
+          // No heatmaps available; leave the overlay empty.
+        }
+      }
+
       // When served by the multi-image (folder) server, the slide to view is
       // passed as a ?slide=<relpath> query param that must be forwarded to the
       // /info and /tiles endpoints. The single-slide server ignores it.
@@ -856,7 +1058,10 @@
 
         map.getView().fit(extent, { padding: [20, 20, 20, 20] });
 
-        // Re-attach annotation layers; the map was just recreated.
+        // The map was just recreated; re-attach overlay layers. Heatmaps sit
+        // below annotations (z-index ordering is set on the layers themselves).
+        currentProjection = projection;
+        syncHeatmapLayers();
         syncAnnotationLayers();
       }
 
@@ -927,9 +1132,9 @@
         currentImageIndex = slideInfo.primary_index || 0;
 
         populateImageSwitcher();
-        selectImage(currentImageIndex);
-
+        await loadHeatmapsFromServer();
         loadAnnotationsFromServer();
+        selectImage(currentImageIndex);
 
         document
           .getElementById("format-select")

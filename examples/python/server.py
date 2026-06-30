@@ -27,12 +27,15 @@ Endpoints:
     GET /                                  -> the OpenLayers viewer (index.html)
     GET /info                              -> slide + per-image metadata as JSON
     GET /annotations                       -> GeoJSON annotations (if configured)
+    GET /heatmaps                          -> heatmap overlays (if configured)
+    GET /heatmap.png?name=<name>           -> a rendered heatmap image
     GET /tiles/{image}/{z}/{x}/{y}.{ext}   -> a single tile (ext: jpg | jpeg | png)
 
 Annotations are optional GeoJSON whose coordinates are in level-0 slide pixels
 (origin top-left, y pointing down). ``--annotations`` may point to a single file
 or to a folder; when it is a folder, *every* ``*.json`` / ``*.geojson`` inside
-is served as a separate, individually toggleable layer.
+is served as a separate, individually toggleable layer. ``--heatmaps`` works the
+same way for heatmap overlays (PNG+JSON pairs, or legacy TSVs).
 """
 
 from __future__ import annotations
@@ -48,6 +51,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 import fastslide
 from fastslide.xyz_pyramid import XYZPyramid
 
+import heatmap as heatmap_lib
+
 _HERE = Path(__file__).resolve().parent
 _INDEX_HTML = _HERE / "index.html"
 
@@ -58,6 +63,27 @@ _MEDIA_TYPES = {
 }
 
 _ANNOTATION_EXTENSIONS = (".json", ".geojson")
+_HEATMAP_EXTENSIONS = (".png", ".tsv")
+
+
+def _heatmap_sources(root: Path) -> list[Path]:
+    """Returns heatmap source files under ``root`` (a file or folder)."""
+    files: list[Path] = []
+    if root.is_dir():
+        for ext in _HEATMAP_EXTENSIONS:
+            files.extend(p for p in root.rglob(f"*{ext}") if p.is_file())
+    elif root.is_file():
+        files = [root]
+    # Prefer a rendered .png over its source .tsv when both share a base name.
+    best: dict[tuple[str, str], Path] = {}
+    for p in files:
+        key = (str(p.parent), p.stem.lower())
+        current = best.get(key)
+        if current is None or (
+            current.suffix.lower() != ".png" and p.suffix.lower() == ".png"
+        ):
+            best[key] = p
+    return sorted(best.values())
 
 
 def create_app(
@@ -65,6 +91,7 @@ def create_app(
     tile_size: int = 256,
     jpeg_quality: int = 85,
     annotations_path: str | Path | None = None,
+    heatmaps_path: str | Path | None = None,
 ) -> FastAPI:
     """Builds the FastAPI app serving XYZ tiles for a single slide.
 
@@ -72,14 +99,17 @@ def create_app(
         slide_path: Path to the whole-slide image to serve.
         tile_size: Tile edge length in pixels.
         jpeg_quality: Quality used when encoding JPEG tiles.
-        annotations_path: Optional path to a GeoJSON file with annotations in
-            level-0 slide pixel coordinates.
+        annotations_path: Optional path to a GeoJSON file (or folder) with
+            annotations in level-0 slide pixel coordinates.
+        heatmaps_path: Optional path to a heatmap (PNG+JSON or TSV) or a folder
+            of them.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
     """
     slide = fastslide.FastSlide.from_file_path(str(slide_path))
     annotations_file = Path(annotations_path).resolve() if annotations_path else None
+    heatmaps_file = Path(heatmaps_path).resolve() if heatmaps_path else None
 
     # One XYZ pyramid per navigable image in the file. Most slides expose a
     # single image; some (e.g. Olympus VSI) expose a navigator plus one or more
@@ -129,6 +159,39 @@ def create_app(
             items.append({"name": path.stem, "geojson": geojson})
         return JSONResponse({"annotations": items})
 
+    @app.get("/heatmaps")
+    def heatmaps() -> JSONResponse:
+        items: list[dict[str, object]] = []
+        if heatmaps_file is not None:
+            for source in _heatmap_sources(heatmaps_file):
+                try:
+                    _, meta = heatmap_lib.ensure_rendered(source)
+                except (OSError, ValueError):
+                    continue
+                items.append(
+                    {
+                        "name": source.stem,
+                        "extent": heatmap_lib.map_extent(meta),
+                        "width": meta["width"],
+                        "height": meta["height"],
+                        "max_value": meta["max_value"],
+                    }
+                )
+        return JSONResponse({"heatmaps": items})
+
+    @app.get("/heatmap.png")
+    def heatmap_png(name: str, cmap: str = heatmap_lib.DEFAULT_COLORMAP) -> Response:
+        if heatmaps_file is not None:
+            for source in _heatmap_sources(heatmaps_file):
+                if source.stem == name:
+                    try:
+                        png_path, _ = heatmap_lib.ensure_rendered(source)
+                        data = heatmap_lib.colorize_png(str(png_path), cmap)
+                    except (OSError, ValueError) as exc:
+                        raise HTTPException(status_code=500, detail=str(exc)) from exc
+                    return Response(content=data, media_type="image/png")
+        raise HTTPException(status_code=404, detail="heatmap not found")
+
     @app.get("/tiles/{image}/{z}/{x}/{y}.{ext}")
     def tile(image: int, z: int, x: int, y: int, ext: str) -> Response:
         media_type = _MEDIA_TYPES.get(ext.lower())
@@ -157,6 +220,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="GeoJSON file, or a folder of GeoJSON files, with level-0 annotations.",
     )
+    parser.add_argument(
+        "--heatmaps",
+        default=None,
+        help="Heatmap (PNG+JSON or TSV), or a folder of them, to overlay.",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +236,7 @@ def main() -> None:
         tile_size=args.tile_size,
         jpeg_quality=args.jpeg_quality,
         annotations_path=args.annotations,
+        heatmaps_path=args.heatmaps,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

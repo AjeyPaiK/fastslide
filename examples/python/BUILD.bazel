@@ -8,6 +8,8 @@ VIEWER_DEPS = [
     requirement("uvicorn"),
     requirement("pillow"),
     requirement("numpy"),
+    requirement("pandas"),
+    requirement("matplotlib"),
     "//python:fastslide",
 ]
 
@@ -16,7 +18,10 @@ VIEWER_DEPS = [
 # then open http://127.0.0.1:8000
 aspect_py_binary(
     name = "viewer",
-    srcs = ["server.py"],
+    srcs = [
+        "heatmap.py",
+        "server.py",
+    ],
     data = ["index.html"],
     main = "server.py",
     deps = VIEWER_DEPS,
@@ -27,7 +32,10 @@ aspect_py_binary(
 # then open http://127.0.0.1:8000
 aspect_py_binary(
     name = "viewer_multiimage",
-    srcs = ["server_multiimage.py"],
+    srcs = [
+        "heatmap.py",
+        "server_multiimage.py",
+    ],
     data = [
         "browser.html",
         "index.html",

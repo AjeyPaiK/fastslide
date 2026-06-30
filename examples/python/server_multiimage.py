@@ -59,6 +59,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 import fastslide
 from fastslide.xyz_pyramid import XYZPyramid
 
+import heatmap as heatmap_lib
+
 _HERE = Path(__file__).resolve().parent
 _INDEX_HTML = _HERE / "index.html"
 _BROWSER_HTML = _HERE / "browser.html"
@@ -132,11 +134,33 @@ def _collect_geojson(directory: Path) -> list[Path]:
     return files
 
 
+def _dedupe_heatmap_sources(paths: list[Path]) -> list[Path]:
+    """Collapses heatmap sources sharing a base name, preferring ``.png``.
+
+    A heatmap may exist as a rendered ``.png`` (with JSON sidecar) and/or the
+    original ``.tsv``; both describe the same heatmap, so keep only one source
+    per ``(folder, base name)`` and prefer the already-rendered PNG.
+    """
+    best: dict[tuple[str, str], Path] = {}
+    for p in paths:
+        key = (str(p.parent), p.stem.lower())
+        current = best.get(key)
+        if current is None or (
+            current.suffix.lower() != ".png" and p.suffix.lower() == ".png"
+        ):
+            best[key] = p
+    return sorted(best.values())
+
+
+_HEATMAP_EXTENSIONS = (".png", ".tsv")
+
+
 def create_app(
     root: str | Path,
     tile_size: int = 256,
     jpeg_quality: int = 85,
     annotations_dir: str | Path | None = None,
+    heatmaps_dir: str | Path | None = None,
 ) -> FastAPI:
     """Builds the FastAPI app serving XYZ tiles for every slide under ``root``.
 
@@ -146,6 +170,8 @@ def create_app(
         jpeg_quality: Quality used when encoding JPEG tiles.
         annotations_dir: Optional directory holding per-slide GeoJSON files,
             matched by the slide's file stem (and mirrored sub-path).
+        heatmaps_dir: Optional directory holding per-slide heatmaps (PNG + JSON
+            pairs, or legacy TSVs), matched the same way as annotations.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
@@ -157,6 +183,10 @@ def create_app(
     annotations_root = Path(annotations_dir).resolve() if annotations_dir else None
     if annotations_root is not None and not annotations_root.is_dir():
         raise NotADirectoryError(f"not a directory: {annotations_root}")
+
+    heatmaps_root = Path(heatmaps_dir).resolve() if heatmaps_dir else None
+    if heatmaps_root is not None and not heatmaps_root.is_dir():
+        raise NotADirectoryError(f"not a directory: {heatmaps_root}")
 
     extensions = _supported_extensions()
 
@@ -212,6 +242,46 @@ def create_app(
                 continue
             result.append(resolved)
         return sorted(result)
+
+    def find_heatmap_files(rel: str) -> list[Path]:
+        """Returns the heatmap source files belonging to a slide.
+
+        Mirrors :func:`find_annotation_files` (per-slide subfolder + stem-matched
+        flat files), then collapses duplicate ``.png`` / ``.tsv`` sources.
+        """
+        if heatmaps_root is None:
+            return []
+        rel_path = Path(rel)
+        stem = rel_path.stem
+        found: dict[Path, None] = {}
+
+        for subdir in (heatmaps_root / stem, heatmaps_root / rel_path.parent / stem):
+            if subdir.is_dir():
+                for ext in _HEATMAP_EXTENSIONS:
+                    for f in subdir.rglob(f"*{ext}"):
+                        if f.is_file():
+                            found[f.resolve()] = None
+
+        for directory in (heatmaps_root, heatmaps_root / rel_path.parent):
+            if not directory.is_dir():
+                continue
+            for f in directory.iterdir():
+                if not f.is_file() or f.suffix.lower() not in _HEATMAP_EXTENSIONS:
+                    continue
+                name = f.stem
+                if name == stem or (
+                    name.startswith(stem) and name[len(stem) : len(stem) + 1] in _STEM_SEPARATORS
+                ):
+                    found[f.resolve()] = None
+
+        result: list[Path] = []
+        for resolved in found:
+            try:
+                resolved.relative_to(heatmaps_root)
+            except ValueError:
+                continue
+            result.append(resolved)
+        return _dedupe_heatmap_sources(result)
 
     # Cache the opened slide per relative path so repeated tile requests reuse
     # the same reader. The cached tuple keeps the FastSlide handle alive, which
@@ -279,6 +349,49 @@ def create_app(
             items.append({"name": name, "geojson": geojson})
         return JSONResponse({"annotations": items})
 
+    def _heatmap_name(source: Path) -> str:
+        try:
+            return source.relative_to(heatmaps_root).with_suffix("").as_posix()
+        except ValueError:
+            return source.stem
+
+    @app.get("/heatmaps")
+    def heatmaps(slide: str = Query(...)) -> JSONResponse:
+        resolve_slide(slide)  # validate the slide reference (404 otherwise)
+        items: list[dict[str, object]] = []
+        for source in find_heatmap_files(slide):
+            try:
+                _, meta = heatmap_lib.ensure_rendered(source)
+            except (OSError, ValueError):
+                continue
+            items.append(
+                {
+                    "name": _heatmap_name(source),
+                    "extent": heatmap_lib.map_extent(meta),
+                    "width": meta["width"],
+                    "height": meta["height"],
+                    "max_value": meta["max_value"],
+                }
+            )
+        return JSONResponse({"heatmaps": items})
+
+    @app.get("/heatmap.png")
+    def heatmap_png(
+        slide: str = Query(...),
+        name: str = Query(...),
+        cmap: str = Query(heatmap_lib.DEFAULT_COLORMAP),
+    ) -> Response:
+        resolve_slide(slide)
+        for source in find_heatmap_files(slide):
+            if _heatmap_name(source) == name:
+                try:
+                    png_path, _ = heatmap_lib.ensure_rendered(source)
+                    data = heatmap_lib.colorize_png(str(png_path), cmap)
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=500, detail=str(exc)) from exc
+                return Response(content=data, media_type="image/png")
+        raise HTTPException(status_code=404, detail="heatmap not found")
+
     @app.get("/tiles/{image}/{z}/{x}/{y}.{ext}")
     def tile(image: int, z: int, x: int, y: int, ext: str, slide: str = Query(...)) -> Response:
         media_type = _MEDIA_TYPES.get(ext.lower())
@@ -308,6 +421,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Directory of per-slide GeoJSON files (matched by slide stem).",
     )
+    parser.add_argument(
+        "--heatmaps-dir",
+        default=None,
+        help="Directory of per-slide heatmaps (PNG+JSON or TSV, matched by slide stem).",
+    )
     return parser.parse_args()
 
 
@@ -319,6 +437,7 @@ def main() -> None:
         tile_size=args.tile_size,
         jpeg_quality=args.jpeg_quality,
         annotations_dir=args.annotations_dir,
+        heatmaps_dir=args.heatmaps_dir,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

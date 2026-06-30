@@ -118,6 +118,59 @@ listed by its classification name (falling back to the file name) with its own
 controls shown underneath: visibility, color, outline width, opacity, and -- for
 layers containing points -- the circle diameter (mm).
 
+## Heatmaps (overlay)
+
+A heatmap is a low-resolution intensity grid overlaid on a region of the slide:
+each cell covers `size_per_pixel` x `size_per_pixel` level-0 pixels, with the
+grid's top-left at `(x_offset, y_offset)` (also level-0 pixels). Intensity is
+rendered through a **standard colormap** (default `jet`; `turbo`, `viridis`,
+`inferno`, `magma`, `plasma`, `hot`, `gray` are also selectable). Each heatmap
+gets its own colormap selector, **alpha (opacity) slider**, and show/hide toggle
+in the sidebar.
+
+- `server.py`: `--heatmaps /path/to/heatmap` (a file or a folder of heatmaps).
+- `server_multiimage.py`: `--heatmaps-dir /path/to/heatmaps` (matched to slides
+  exactly like `--annotations-dir`: a per-slide subfolder named after the slide
+  stem, or stem-matched flat files).
+
+```bash
+python server_multiimage.py /path/to/slides --heatmaps-dir /path/to/heatmaps
+```
+
+**Storage format (efficient, O(1) to serve).** A heatmap is a pair of files
+sharing a base name:
+
+- `<name>.png` -- a greyscale + alpha (`LA`) image, one pixel per cell. The grey
+  channel is the **raw intensity** normalized to `0..255`; alpha is `0` for empty
+  cells (intensity `0`) so the slide shows through.
+- `<name>.json` -- `{"x_offset", "y_offset", "size_per_pixel", "width",
+  "height", "max_value"}`.
+
+The stored PNG keeps raw intensity; the colormap is applied at serve time
+(`/heatmap.png?...&cmap=<name>`) and cached, so the colormap can be switched in
+the viewer without re-converting. The viewer draws the result as a single
+georeferenced image, so render cost is independent of the number of cells, and
+the server just streams a small static PNG. Point your generator at this format
+directly for best results.
+
+**Legacy TSV.** The original text format is also accepted:
+
+```text
+Heatmap <x_offset> <y_offset> <size_per_pixel>
+x1  y1  value1
+x2  y2  value2
+...
+```
+
+These can be enormous (one tab-separated line per cell). The server renders a
+TSV into the PNG + JSON pair on first use and caches it next to the TSV; you can
+also convert ahead of time (recommended, since a large TSV is slow to parse):
+
+```bash
+python heatmap.py /path/to/heatmaps          # converts every *.tsv under the dir
+python heatmap.py /path/to/heatmap.tsv       # or a single file
+```
+
 ## Endpoints
 
 `server.py` (single slide):
@@ -127,6 +180,8 @@ layers containing points -- the circle diameter (mm).
 | `GET /`                                | The OpenLayers viewer (`index.html`).                                                                                                                  |
 | `GET /info`                            | Slide metadata as JSON: file name/format, `primary_index`, and per-image entries (dimensions, zoom range, tile size, native levels, MPP, resolutions). |
 | `GET /annotations`                     | Annotation layers as `{ "annotations": [ { "name", "geojson" }, ... ] }` (empty unless `--annotations` is set).                                         |
+| `GET /heatmaps`                        | Heatmap overlays as `{ "heatmaps": [ { "name", "extent", "width", "height", "max_value" }, ... ] }` (empty unless `--heatmaps` is set).                  |
+| `GET /heatmap.png?name=<name>&cmap=<cmap>` | The rendered PNG for one heatmap, colorized with `cmap` (default `jet`).                                                                            |
 | `GET /tiles/{image}/{z}/{x}/{y}.{ext}` | A single tile from image `image`; `ext` is `jpg`, `jpeg`, or `png`.                                                                                    |
 
 `server_multiimage.py` (folder): the slide is selected with a `?slide=<relpath>`
@@ -139,6 +194,8 @@ query parameter, where `<relpath>` is the path relative to the served folder.
 | `GET /viewer?slide=<relpath>`                          | The OpenLayers viewer for one slide.                     |
 | `GET /info?slide=<relpath>`                            | Same payload as the single-slide `/info`.                |
 | `GET /annotations?slide=<relpath>`                     | All annotation layers for the slide as a named list.     |
+| `GET /heatmaps?slide=<relpath>`                        | All heatmap overlays for the slide as a named list.      |
+| `GET /heatmap.png?slide=<relpath>&name=<name>&cmap=<cmap>` | The rendered PNG for one heatmap (colorized, default `jet`). |
 | `GET /tiles/{image}/{z}/{x}/{y}.{ext}?slide=<relpath>` | A single tile from a slide in the folder.                |
 
 Slides with multiple navigable images (e.g. an Olympus VSI navigator plus
