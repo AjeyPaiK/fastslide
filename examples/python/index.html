@@ -156,10 +156,16 @@
               />
             </svg>
           </button>
-          <h2
-            id="header-slide-name"
-            class="min-w-0 flex-1 truncate text-center text-sm font-medium text-gray-200 sm:text-base"
-          ></h2>
+          <div class="min-w-0 flex-1 text-center">
+            <h2
+              id="header-slide-name"
+              class="truncate text-sm font-medium text-gray-200 sm:text-base"
+            ></h2>
+            <p
+              id="header-slide-position"
+              class="hidden truncate text-xs text-gray-500"
+            ></p>
+          </div>
           <button
             id="slide-next"
             type="button"
@@ -354,6 +360,14 @@
 
       <div id="viewer-container" class="flex-1 relative bg-gray-900">
         <div id="map" class="absolute inset-0"></div>
+        <div
+          id="heatmap-status"
+          class="hidden absolute bottom-4 left-4 z-20 rounded-lg border border-gray-600/80 bg-gray-900/90 px-3 py-2 text-xs text-gray-200 shadow-lg backdrop-blur-sm"
+          role="status"
+          aria-live="polite"
+        >
+          Loading heatmap...
+        </div>
       </div>
     </main>
 
@@ -364,13 +378,12 @@
       let currentImageIndex = 0;
       // The current image's pixel projection, needed to georeference heatmaps.
       let currentProjection = null;
+      let currentTileGrid = null;
 
       // --- Heatmaps ------------------------------------------------------
-      // A heatmap is a low-resolution intensity image overlaid on a region of
-      // the slide. The server returns each heatmap's pre-rendered PNG plus its
-      // map extent (already in level-0 px with y negated), so the viewer just
-      // draws one georeferenced image. Each has its own opacity (alpha) slider.
-      let heatmapGroups = []; // [{ name, title, extent, width, height, layer, visible, opacity }]
+      // Tiled XYZ heatmaps from heatmaps.sqlite; colormap is applied per tile
+      // in the browser using a server-provided LUT.
+      let heatmapGroups = [];
 
       // --- Annotations ---------------------------------------------------
       // GeoJSON coordinates are in level-0 slide pixels with the origin at the
@@ -433,9 +446,7 @@
         if (Array.isArray(c) && c.length >= 3) {
           return [c[0] | 0, c[1] | 0, c[2] | 0];
         }
-        const hex = colorForClass(classNameOf(props));
-        const n = parseInt(hex.slice(1), 16);
-        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+        return [0, 0, 0];
       }
 
       function cssRgb(rgb, alpha) {
@@ -759,7 +770,7 @@
             visible: true,
             // Per-layer customization (editable in the sidebar):
             hasPoints: dataHasPoints(entry.data),
-            colorOverride: null, // hex string; null = use feature/class color
+            colorOverride: "#000000",
             strokeWidth: 2,
             opacity: 1,
             diameterMm: pointDiameterMm, // circle diameter for point geometries
@@ -811,7 +822,6 @@
       }
 
       // --- Heatmap overlays ----------------------------------------------
-      // Standard colormaps offered for heatmaps (rendered server-side).
       const HEATMAP_COLORMAPS = [
         "jet",
         "turbo",
@@ -823,13 +833,29 @@
         "gray",
       ];
 
-      function heatmapImageUrl(name, cmap) {
+      const colormapLutCache = {};
+
+      function heatmapTileUrl(name, z, x, y) {
         return withSlide(
-          "/heatmap.png?name=" +
-            encodeURIComponent(name) +
-            "&cmap=" +
-            encodeURIComponent(cmap || "jet")
+          `/heatmap-tiles/${encodeURIComponent(name)}/${z}/${x}/${y}.png`
         );
+      }
+
+      function colorizeLaImageData(imageData, lutBytes) {
+        const pixels = imageData.data;
+        for (let i = 0; i < pixels.length; i += 4) {
+          const grey = pixels[i];
+          const alpha = pixels[i + 3];
+          if (alpha < 1) {
+            pixels[i + 3] = 0;
+            continue;
+          }
+          const idx = grey * 3;
+          pixels[i] = lutBytes[idx];
+          pixels[i + 1] = lutBytes[idx + 1];
+          pixels[i + 2] = lutBytes[idx + 2];
+        }
+        return imageData;
       }
 
       function heatmapColorbarUrl(cmap) {
@@ -838,6 +864,17 @@
             encodeURIComponent(cmap || "jet") +
             "&width=160&height=24"
         );
+      }
+
+      async function fetchColormapLUT(cmap) {
+        if (colormapLutCache[cmap]) return colormapLutCache[cmap];
+        const resp = await fetch(
+          withSlide("/heatmap-lut?cmap=" + encodeURIComponent(cmap || "jet"))
+        );
+        if (!resp.ok) throw new Error("colormap LUT unavailable: " + cmap);
+        const lut = new Uint8Array(await resp.arrayBuffer());
+        colormapLutCache[cmap] = lut;
+        return lut;
       }
 
       function formatHeatmapValue(value) {
@@ -855,31 +892,128 @@
         el.textContent = `${n} heatmap${n === 1 ? "" : "s"}`;
       }
 
-      // (Re)create the image layer for each heatmap on the current map, using
-      // the current image's projection for georeferencing.
+      function setHeatmapStatus(visible, message) {
+        const el = document.getElementById("heatmap-status");
+        if (!el) return;
+        if (visible) {
+          el.textContent = message || "Loading heatmap...";
+          el.classList.remove("hidden");
+        } else {
+          el.classList.add("hidden");
+        }
+      }
+
+      function resetHeatmapSources(groups) {
+        (groups || heatmapGroups).forEach((g) => {
+          g.tileSource = null;
+        });
+      }
+
+      function buildHeatmapTileSource(group) {
+        if (!currentProjection || !currentTileGrid) return null;
+        group.tileSource = new ol.source.XYZ({
+          projection: currentProjection,
+          tileGrid: currentTileGrid,
+          wrapX: false,
+          tileUrlFunction: function (tileCoord) {
+            if (!tileCoord) return undefined;
+            const z = tileCoord[0];
+            const x = tileCoord[1];
+            const y = tileCoord[2];
+            if (x < 0 || y < 0) return undefined;
+            return heatmapTileUrl(group.name, z, x, y);
+          },
+          tileLoadFunction: function (tile, src) {
+            const img = tile.getImage();
+            fetch(src)
+              .then((resp) => {
+                if (!resp.ok) throw new Error("tile " + resp.status);
+                return resp.blob();
+              })
+              .then((blob) => createImageBitmap(blob))
+              .then((bitmap) => {
+                const canvas = document.createElement("canvas");
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(bitmap, 0, 0);
+                if (group.lutBytes) {
+                  const imageData = ctx.getImageData(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                  );
+                  ctx.putImageData(
+                    colorizeLaImageData(imageData, group.lutBytes),
+                    0,
+                    0
+                  );
+                }
+                img.src = canvas.toDataURL("image/png");
+              })
+              .catch(() => {
+                img.src =
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+              });
+          },
+        });
+        return group.tileSource;
+      }
+
+      function attachHeatmapLayer(group) {
+        if (!map || !currentProjection || !group.lutBytes) {
+          return;
+        }
+        if (group.layer) {
+          try {
+            map.removeLayer(group.layer);
+          } catch (err) {
+            /* layer not on this map */
+          }
+        }
+        buildHeatmapTileSource(group);
+        group.layer = new ol.layer.Tile({
+          source: group.tileSource,
+          opacity: group.opacity,
+          visible: group.visible,
+          zIndex: 5,
+        });
+        map.addLayer(group.layer);
+      }
+
+      async function prepareHeatmap(group) {
+        group.lutBytes = await fetchColormapLUT(group.colormap);
+        attachHeatmapLayer(group);
+      }
+
+      async function loadHeatmapsInBackground() {
+        const pending = heatmapGroups.filter((g) => !g.lutBytes);
+        if (!pending.length) return;
+        setHeatmapStatus(
+          true,
+          pending.length > 1 ? "Loading heatmaps..." : "Loading heatmap..."
+        );
+        for (let i = 0; i < pending.length; i++) {
+          const group = pending[i];
+          if (pending.length > 1) {
+            setHeatmapStatus(
+              true,
+              `Loading heatmap (${i + 1}/${pending.length})...`
+            );
+          }
+          try {
+            await prepareHeatmap(group);
+          } catch (err) {
+            console.warn("heatmap load failed", group.name, err);
+          }
+        }
+        setHeatmapStatus(false);
+      }
+
       function syncHeatmapLayers() {
         if (!map || !currentProjection) return;
-        heatmapGroups.forEach((g) => {
-          if (g.layer) {
-            try {
-              map.removeLayer(g.layer);
-            } catch (err) {
-              /* layer not on this map */
-            }
-          }
-          g.layer = new ol.layer.Image({
-            source: new ol.source.ImageStatic({
-              url: heatmapImageUrl(g.name, g.colormap),
-              imageExtent: g.extent,
-              projection: currentProjection,
-              interpolate: false, // crisp cells, no smoothing
-            }),
-            opacity: g.opacity,
-            visible: g.visible,
-            zIndex: 5, // below annotation layers (zIndex 10), above tiles
-          });
-          map.addLayer(g.layer);
-        });
+        heatmapGroups.forEach((g) => attachHeatmapLayer(g));
       }
 
       // Renders each heatmap with a visibility toggle and an alpha slider.
@@ -972,19 +1106,16 @@
           colorbarWrap.appendChild(colorbarImg);
           colorbarWrap.appendChild(colorbarLabels);
 
-          cmapSelect.addEventListener("change", () => {
+          cmapSelect.addEventListener("change", async () => {
             g.colormap = cmapSelect.value;
             colorbarImg.src = heatmapColorbarUrl(g.colormap);
-            // Re-fetch the heatmap image rendered with the new colormap.
-            if (g.layer) {
-              g.layer.setSource(
-                new ol.source.ImageStatic({
-                  url: heatmapImageUrl(g.name, g.colormap),
-                  imageExtent: g.extent,
-                  projection: currentProjection,
-                  interpolate: false,
-                })
-              );
+            try {
+              g.lutBytes = await fetchColormapLUT(g.colormap);
+              if (g.tileSource) {
+                g.tileSource.refresh();
+              }
+            } catch (err) {
+              console.warn("colormap update failed", g.name, err);
             }
           });
           cmapField.appendChild(cmapSpan);
@@ -996,16 +1127,39 @@
         });
       }
 
+      let heatmapPollTimer = null;
+
+      function clearHeatmapPoll() {
+        if (heatmapPollTimer !== null) {
+          clearTimeout(heatmapPollTimer);
+          heatmapPollTimer = null;
+        }
+      }
+
       async function loadHeatmapsFromServer() {
+        resetHeatmapSources();
         try {
           const resp = await fetch(withSlide("/heatmaps"));
           if (!resp.ok) return;
           const data = await resp.json();
           const list = Array.isArray(data.heatmaps) ? data.heatmaps : [];
+          if (data.pending && list.length === 0) {
+            setHeatmapStatus(true, "Heatmap is being generated...");
+            if (heatmapPollTimer === null) {
+              heatmapPollTimer = setTimeout(() => {
+                heatmapPollTimer = null;
+                void loadHeatmapsFromServer();
+              }, 3000);
+            }
+            heatmapGroups = [];
+            renderHeatmapList();
+            return;
+          }
+          clearHeatmapPoll();
           heatmapGroups = list.map((h) => ({
             name: h.name,
             title: h.title || h.name,
-            extent: h.extent.map(Number),
+            extent: h.extent ? h.extent.map(Number) : null,
             width: h.width,
             height: h.height,
             maxValue: h.max_value,
@@ -1013,11 +1167,13 @@
             visible: true,
             opacity: 0.6,
             colormap: "jet",
+            tileSource: null,
+            lutBytes: null,
           }));
-          syncHeatmapLayers();
           renderHeatmapList();
+          void loadHeatmapsInBackground();
         } catch (err) {
-          // No heatmaps available; leave the overlay empty.
+          console.warn("failed to load heatmaps", err);
         }
       }
 
@@ -1027,11 +1183,47 @@
       const slideParam = new URLSearchParams(window.location.search).get(
         "slide"
       );
+      const VIEWER_SLIDES_KEY = "fastslide-viewer-slides";
       let slideList = [];
+      let slideListFiltered = false;
 
       function goToSlide(relpath) {
         window.location.href =
           "/viewer?slide=" + encodeURIComponent(relpath);
+      }
+
+      function readStoredSlideList() {
+        try {
+          const raw = sessionStorage.getItem(VIEWER_SLIDES_KEY);
+          if (!raw) return null;
+          const data = JSON.parse(raw);
+          if (!Array.isArray(data.paths) || data.paths.length === 0) return null;
+          return data;
+        } catch (err) {
+          return null;
+        }
+      }
+
+      function resolveSlideList(allPaths) {
+        const stored = readStoredSlideList();
+        if (
+          stored &&
+          slideParam &&
+          stored.paths.includes(slideParam)
+        ) {
+          slideListFiltered = Boolean(stored.filtered);
+          return stored.paths;
+        }
+        slideListFiltered = false;
+        return allPaths;
+      }
+
+      function updateSlideNavPosition(idx) {
+        const el = document.getElementById("header-slide-position");
+        if (!el || slideList.length === 0) return;
+        const base = `${idx + 1} / ${slideList.length}`;
+        el.textContent = slideListFiltered ? `${base} · filtered` : base;
+        el.classList.remove("hidden");
       }
 
       async function initSlideNav() {
@@ -1046,12 +1238,14 @@
           const resp = await fetch("/api/slides");
           if (!resp.ok) return;
           const data = await resp.json();
-          slideList = (data.slides || []).map((s) => s.path).sort();
+          const allPaths = (data.slides || []).map((s) => s.path);
+          slideList = resolveSlideList(allPaths);
         } catch (err) {
           return;
         }
         const idx = slideList.indexOf(slideParam);
         if (idx < 0) return;
+        updateSlideNavPosition(idx);
         prevBtn.disabled = idx <= 0;
         nextBtn.disabled = idx >= slideList.length - 1;
         prevBtn.onclick = () => {
@@ -1120,6 +1314,7 @@
           resolutions: resolutions,
           tileSize: tileSize,
         });
+        currentTileGrid = tileGrid;
 
         const source = new ol.source.XYZ({
           projection: projection,
@@ -1263,9 +1458,9 @@
 
         await initSlideNav();
         populateImageSwitcher();
-        await loadHeatmapsFromServer();
-        loadAnnotationsFromServer();
         selectImage(currentImageIndex);
+        await loadAnnotationsFromServer();
+        void loadHeatmapsFromServer();
 
         document
           .getElementById("format-select")

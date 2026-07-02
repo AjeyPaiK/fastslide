@@ -8,7 +8,6 @@ VIEWER_DEPS = [
     requirement("uvicorn"),
     requirement("pillow"),
     requirement("numpy"),
-    requirement("pandas"),
     requirement("matplotlib"),
     "//python:fastslide",
 ]
@@ -19,7 +18,9 @@ VIEWER_DEPS = [
 aspect_py_binary(
     name = "viewer",
     srcs = [
+        "geojson_labels.py",
         "heatmap.py",
+        "heatmap_db.py",
         "server.py",
     ],
     data = ["index.html"],
@@ -33,7 +34,9 @@ aspect_py_binary(
 aspect_py_binary(
     name = "viewer_multiimage",
     srcs = [
+        "geojson_labels.py",
         "heatmap.py",
+        "heatmap_db.py",
         "server_multiimage.py",
     ],
     data = [

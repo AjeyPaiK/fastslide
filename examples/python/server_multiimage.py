@@ -50,6 +50,8 @@ import argparse
 import functools
 import json
 import os
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import uvicorn
@@ -60,6 +62,7 @@ import fastslide
 from fastslide.xyz_pyramid import XYZPyramid
 
 import heatmap as heatmap_lib
+from heatmap_db import HeatmapDatabase
 import geojson_labels
 
 _HERE = Path(__file__).resolve().parent
@@ -135,25 +138,48 @@ def _collect_geojson(directory: Path) -> list[Path]:
     return files
 
 
-def _dedupe_heatmap_sources(paths: list[Path]) -> list[Path]:
-    """Collapses heatmap sources sharing a base name, preferring ``.png``.
-
-    A heatmap may exist as a rendered ``.png`` (with JSON sidecar) and/or the
-    original ``.tsv``; both describe the same heatmap, so keep only one source
-    per ``(folder, base name)`` and prefer the already-rendered PNG.
-    """
-    best: dict[tuple[str, str], Path] = {}
-    for p in paths:
-        key = (str(p.parent), p.stem.lower())
-        current = best.get(key)
-        if current is None or (
-            current.suffix.lower() != ".png" and p.suffix.lower() == ".png"
-        ):
-            best[key] = p
-    return sorted(best.values())
+def _stem_matches_slide(file_stem: str, slide_stem: str) -> bool:
+    """True when a flat overlay filename belongs to ``slide_stem``."""
+    return file_stem == slide_stem or (
+        file_stem.startswith(slide_stem)
+        and file_stem[len(slide_stem) : len(slide_stem) + 1] in _STEM_SEPARATORS
+    )
 
 
-_HEATMAP_EXTENSIONS = (".png", ".tsv")
+def _overlay_layer_name(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).with_suffix("").as_posix()
+    except ValueError:
+        return path.stem
+
+
+def _overlay_summary(paths: list[Path], root: Path) -> dict[str, object]:
+    layers = sorted({_overlay_layer_name(root, path) for path in paths})
+    return {"count": len(layers), "layers": layers}
+
+
+def _attach_overlay_metadata(
+    slides: list[dict[str, object]],
+    *,
+    annotations_root: Path | None,
+    heatmap_db_for_slide: Callable[[str], HeatmapDatabase | None],
+    find_annotation_files: Callable[[str], list[Path]],
+) -> None:
+    for slide in slides:
+        rel = str(slide["path"])
+        overlays: dict[str, dict[str, object]] = {}
+        if annotations_root is not None:
+            overlays["annotations"] = _overlay_summary(find_annotation_files(rel), annotations_root)
+        db = heatmap_db_for_slide(rel)
+        if db is not None:
+            layers = db.try_list_heatmaps()
+            if layers is None:
+                overlays["heatmaps"] = {"count": 0, "layers": [], "pending": True}
+            else:
+                names = [r.name for r in layers]
+                overlays["heatmaps"] = {"count": len(names), "layers": sorted(names)}
+        if overlays:
+            slide["overlays"] = overlays
 
 
 def create_app(
@@ -162,6 +188,7 @@ def create_app(
     jpeg_quality: int = 85,
     annotations_dir: str | Path | None = None,
     heatmaps_dir: str | Path | None = None,
+    heatmaps_db: str | Path | None = None,
 ) -> FastAPI:
     """Builds the FastAPI app serving XYZ tiles for every slide under ``root``.
 
@@ -171,8 +198,11 @@ def create_app(
         jpeg_quality: Quality used when encoding JPEG tiles.
         annotations_dir: Optional directory holding per-slide GeoJSON files,
             matched by the slide's file stem (and mirrored sub-path).
-        heatmaps_dir: Optional directory holding per-slide heatmaps (PNG + JSON
-            pairs, or legacy TSVs), matched the same way as annotations.
+        heatmaps_dir: Optional directory of per-slide ``heatmaps.sqlite`` databases,
+            matched like annotations (per-slide subfolder or stem-named file).
+        heatmaps_db: Optional SQLite database file or directory of per-slide
+            ``heatmaps.sqlite`` databases. When both are set, either root may
+            supply a database for a slide.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
@@ -185,11 +215,45 @@ def create_app(
     if annotations_root is not None and not annotations_root.is_dir():
         raise NotADirectoryError(f"not a directory: {annotations_root}")
 
-    heatmaps_root = Path(heatmaps_dir).resolve() if heatmaps_dir else None
-    if heatmaps_root is not None and not heatmaps_root.is_dir():
-        raise NotADirectoryError(f"not a directory: {heatmaps_root}")
+    heatmaps_dir_path = Path(heatmaps_dir).resolve() if heatmaps_dir else None
+    if heatmaps_dir_path is not None and not heatmaps_dir_path.is_dir():
+        raise NotADirectoryError(f"not a directory: {heatmaps_dir_path}")
+
+    heatmaps_db_path = Path(heatmaps_db).resolve() if heatmaps_db else None
+    heatmaps_db_file: Path | None = None
+    heatmaps_search_roots: list[Path] = []
+    if heatmaps_db_path is not None:
+        if heatmaps_db_path.is_dir():
+            heatmaps_search_roots.append(heatmaps_db_path)
+        elif heatmaps_db_path.is_file():
+            heatmaps_db_file = heatmaps_db_path
+        else:
+            raise FileNotFoundError(f"heatmap database not found: {heatmaps_db_path}")
+    if heatmaps_dir_path is not None and heatmaps_dir_path not in heatmaps_search_roots:
+        heatmaps_search_roots.append(heatmaps_dir_path)
 
     extensions = _supported_extensions()
+
+    def heatmap_db_for_slide(rel: str) -> HeatmapDatabase | None:
+        if heatmaps_db_file is not None:
+            return HeatmapDatabase.for_path(heatmaps_db_file)
+        for root in heatmaps_search_roots:
+            db_path = HeatmapDatabase.resolve_path(root, rel)
+            if db_path is not None:
+                return HeatmapDatabase.for_path(db_path)
+        return None
+
+    @functools.lru_cache(maxsize=256)
+    def _flat_overlay_files(directory: str, extensions_key: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+        """Cached non-recursive listing of overlay files in a directory."""
+        here = Path(directory)
+        if not here.is_dir():
+            return ()
+        rows: list[tuple[str, str]] = []
+        for path in here.iterdir():
+            if path.is_file() and path.suffix.lower() in extensions_key:
+                rows.append((path.stem, str(path.resolve())))
+        return tuple(sorted(rows))
 
     def resolve_slide(rel: str) -> Path:
         """Resolves a slide relative path, guarding against traversal."""
@@ -225,14 +289,11 @@ def create_app(
         for directory in (annotations_root, annotations_root / rel_path.parent):
             if not directory.is_dir():
                 continue
-            for f in directory.iterdir():
-                if not f.is_file() or f.suffix.lower() not in _ANNOTATION_EXTENSIONS:
-                    continue
-                name = f.stem
-                if name == stem or (
-                    name.startswith(stem) and name[len(stem) : len(stem) + 1] in _STEM_SEPARATORS
-                ):
-                    found[f.resolve()] = None
+            for file_stem, resolved_str in _flat_overlay_files(
+                str(directory.resolve()), _ANNOTATION_EXTENSIONS
+            ):
+                if _stem_matches_slide(file_stem, stem):
+                    found[Path(resolved_str)] = None
 
         # Guard against path traversal and return a stable, sorted list.
         result: list[Path] = []
@@ -244,46 +305,6 @@ def create_app(
             result.append(resolved)
         return sorted(result)
 
-    def find_heatmap_files(rel: str) -> list[Path]:
-        """Returns the heatmap source files belonging to a slide.
-
-        Mirrors :func:`find_annotation_files` (per-slide subfolder + stem-matched
-        flat files), then collapses duplicate ``.png`` / ``.tsv`` sources.
-        """
-        if heatmaps_root is None:
-            return []
-        rel_path = Path(rel)
-        stem = rel_path.stem
-        found: dict[Path, None] = {}
-
-        for subdir in (heatmaps_root / stem, heatmaps_root / rel_path.parent / stem):
-            if subdir.is_dir():
-                for ext in _HEATMAP_EXTENSIONS:
-                    for f in subdir.rglob(f"*{ext}"):
-                        if f.is_file():
-                            found[f.resolve()] = None
-
-        for directory in (heatmaps_root, heatmaps_root / rel_path.parent):
-            if not directory.is_dir():
-                continue
-            for f in directory.iterdir():
-                if not f.is_file() or f.suffix.lower() not in _HEATMAP_EXTENSIONS:
-                    continue
-                name = f.stem
-                if name == stem or (
-                    name.startswith(stem) and name[len(stem) : len(stem) + 1] in _STEM_SEPARATORS
-                ):
-                    found[f.resolve()] = None
-
-        result: list[Path] = []
-        for resolved in found:
-            try:
-                resolved.relative_to(heatmaps_root)
-            except ValueError:
-                continue
-            result.append(resolved)
-        return _dedupe_heatmap_sources(result)
-
     # Cache the opened slide per relative path so repeated tile requests reuse
     # the same reader. The cached tuple keeps the FastSlide handle alive, which
     # matters because each SlideImageView only holds a weak reader handle.
@@ -294,6 +315,15 @@ def create_app(
         images = slide.images
         pyramids = tuple(XYZPyramid(images[i], tile_size=tile_size) for i in range(len(images)))
         return slide, pyramids
+
+    def slide_pyramid_info(rel: str) -> tuple[int, int, list[float]] | None:
+        try:
+            _, pyramids = open_slide(rel)
+            primary = pyramids[0]
+            width, height = primary.level0_dimensions
+            return width, height, primary.resolutions
+        except HTTPException:
+            return None
 
     app = FastAPI(title="FastSlide XYZ Multi-Slide Viewer")
 
@@ -307,13 +337,26 @@ def create_app(
 
     @app.get("/api/slides")
     def api_slides() -> JSONResponse:
-        return JSONResponse(
-            {
-                "root": str(root_dir),
-                "extensions": sorted(extensions),
-                "slides": _list_slides(root_dir, extensions),
-            }
+        slides = _list_slides(root_dir, extensions)
+        _attach_overlay_metadata(
+            slides,
+            annotations_root=annotations_root,
+            heatmap_db_for_slide=heatmap_db_for_slide,
+            find_annotation_files=find_annotation_files,
         )
+        overlay_sources: dict[str, bool] = {}
+        if annotations_root is not None:
+            overlay_sources["annotations"] = True
+        if heatmaps_db_file is not None or heatmaps_search_roots:
+            overlay_sources["heatmaps"] = True
+        payload: dict[str, object] = {
+            "root": str(root_dir),
+            "extensions": sorted(extensions),
+            "slides": slides,
+        }
+        if overlay_sources:
+            payload["overlay_sources"] = overlay_sources
+        return JSONResponse(payload)
 
     @app.get("/info")
     def info(slide: str = Query(...)) -> JSONResponse:
@@ -379,56 +422,102 @@ def create_app(
             return ann_titles[stem]
         return None
 
-    def _heatmap_name(source: Path) -> str:
-        try:
-            return source.relative_to(heatmaps_root).with_suffix("").as_posix()
-        except ValueError:
-            return source.stem
-
     @app.get("/heatmaps")
     def heatmaps(slide: str = Query(...)) -> JSONResponse:
         resolve_slide(slide)  # validate the slide reference (404 otherwise)
         ann_titles = _annotation_titles(slide)
         items: list[dict[str, object]] = []
-        for source in find_heatmap_files(slide):
-            try:
-                _, meta = heatmap_lib.ensure_rendered(source)
-            except (OSError, ValueError):
-                continue
-            hm_name = _heatmap_name(source)
+
+        db = heatmap_db_for_slide(slide)
+        if db is None:
+            return JSONResponse({"heatmaps": items})
+
+        records = db.try_list_heatmaps()
+        if records is None:
+            return JSONResponse({"heatmaps": items, "pending": True})
+
+        pyramid = slide_pyramid_info(slide)
+        for record in records:
+            if pyramid is not None:
+                sw, sh, resolutions = pyramid
+                if not record.meta.get("resolutions"):
+                    db.configure_pyramid(
+                        record.id,
+                        slide_width=sw,
+                        slide_height=sh,
+                        tile_size=tile_size,
+                        resolutions=resolutions,
+                    )
+                    refreshed = db.get_by_name(record.name)
+                    if refreshed is not None:
+                        record = refreshed
             title = (
-                heatmap_lib.meta_title(meta)
-                or _heatmap_display_title(hm_name, ann_titles)
-                or hm_name
+                heatmap_lib.meta_title(record.meta)
+                or _heatmap_display_title(record.name, ann_titles)
+                or record.name
             )
-            items.append(
-                {
-                    "name": hm_name,
-                    "title": title,
-                    "extent": heatmap_lib.map_extent(meta),
-                    "width": meta["width"],
-                    "height": meta["height"],
-                    "max_value": meta["max_value"],
-                }
-            )
+            entry = HeatmapDatabase.heatmap_list_entry(record)
+            entry["title"] = title
+            items.append(entry)
         return JSONResponse({"heatmaps": items})
 
-    @app.get("/heatmap.png")
-    def heatmap_png(
+    @app.get("/heatmap-tiles/{name}/{z}/{x}/{y}.png")
+    def heatmap_tile_png(
+        name: str,
+        z: int,
+        x: int,
+        y: int,
         slide: str = Query(...),
-        name: str = Query(...),
+    ) -> Response:
+        resolve_slide(slide)
+        db = heatmap_db_for_slide(slide)
+        if db is None:
+            raise HTTPException(status_code=404, detail="heatmap database not found")
+        record = db.get_by_name(name)
+        if record is None:
+            raise HTTPException(status_code=404, detail="heatmap not found")
+        pyramid = slide_pyramid_info(slide)
+        kwargs: dict[str, object] = {}
+        if pyramid is not None:
+            sw, sh, resolutions = pyramid
+            kwargs = {
+                "slide_width": sw,
+                "slide_height": sh,
+                "tile_size": tile_size,
+                "resolutions": resolutions,
+            }
+            if not record.meta.get("resolutions"):
+                db.configure_pyramid(
+                    record.id,
+                    slide_width=sw,
+                    slide_height=sh,
+                    tile_size=tile_size,
+                    resolutions=resolutions,
+                )
+        try:
+            data = db.get_tile_png(record.id, z, x, y, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if HeatmapDatabase._is_locked_error(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail="heatmap database temporarily locked",
+                ) from exc
+            raise
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return Response(content=data, media_type="image/png")
+
+    @app.get("/heatmap-lut")
+    def heatmap_lut(
+        slide: str = Query(...),
         cmap: str = Query(heatmap_lib.DEFAULT_COLORMAP),
     ) -> Response:
         resolve_slide(slide)
-        for source in find_heatmap_files(slide):
-            if _heatmap_name(source) == name:
-                try:
-                    png_path, _ = heatmap_lib.ensure_rendered(source)
-                    data = heatmap_lib.colorize_png(str(png_path), cmap)
-                except (OSError, ValueError) as exc:
-                    raise HTTPException(status_code=500, detail=str(exc)) from exc
-                return Response(content=data, media_type="image/png")
-        raise HTTPException(status_code=404, detail="heatmap not found")
+        try:
+            data = heatmap_lib.colormap_lut_bytes(cmap)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return Response(content=data, media_type="application/octet-stream")
 
     @app.get("/heatmap-colorbar.png")
     def heatmap_colorbar(
@@ -476,7 +565,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--heatmaps-dir",
         default=None,
-        help="Directory of per-slide heatmaps (PNG+JSON or TSV, matched by slide stem).",
+        help="Directory of per-slide heatmaps.sqlite databases (matched by slide stem).",
+    )
+    parser.add_argument(
+        "--heatmaps-db",
+        default=None,
+        help=(
+            "SQLite heatmap database file or directory of per-slide heatmaps.sqlite "
+            "(XYZ tile pyramid)."
+        ),
     )
     return parser.parse_args()
 
@@ -490,6 +587,7 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         annotations_dir=args.annotations_dir,
         heatmaps_dir=args.heatmaps_dir,
+        heatmaps_db=args.heatmaps_db,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

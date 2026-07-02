@@ -39,6 +39,30 @@
         background-color: #4b5563;
         border-radius: 4px;
       }
+      .overlay-chip {
+        transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+      }
+      .overlay-chip-ann {
+        border-color: rgb(180 83 9 / 0.5);
+      }
+      .overlay-chip-ann-active {
+        background-color: rgb(180 83 9);
+        border-color: rgb(245 158 11);
+        color: white;
+      }
+      .overlay-chip-hm {
+        border-color: rgb(109 40 217 / 0.5);
+      }
+      .overlay-chip-hm-active {
+        background-color: rgb(109 40 217);
+        border-color: rgb(167 139 250);
+        color: white;
+      }
+      .overlay-chip-missing-active {
+        background-color: rgb(55 65 81);
+        border-color: rgb(107 114 128);
+        color: rgb(229 231 235);
+      }
     </style>
   </head>
 
@@ -80,7 +104,7 @@
     <main
       class="flex-1 overflow-hidden flex flex-col max-w-4xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6"
     >
-      <div class="mb-4 flex items-center gap-3">
+      <div class="mb-3 flex items-center gap-3">
         <div class="relative flex-1">
           <input
             id="filter"
@@ -106,6 +130,24 @@
         <span id="count" class="text-sm text-gray-500 whitespace-nowrap"></span>
       </div>
 
+      <div
+        id="overlay-filters"
+        class="hidden mb-3 shrink-0 rounded-lg border border-gray-700/80 bg-gray-800/40 px-3 py-2.5 space-y-2"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-medium text-gray-400">Show slides with</span>
+          <button
+            id="clear-overlay-filters"
+            type="button"
+            class="hidden text-xs text-primary-400 hover:text-primary-300"
+          >
+            Clear
+          </button>
+        </div>
+        <div id="overlay-filter-chips" class="flex flex-wrap gap-2"></div>
+        <p id="overlay-filter-summary" class="text-xs text-gray-500"></p>
+      </div>
+
       <div id="file-list" class="flex-1 overflow-y-auto space-y-2 pr-1"></div>
 
       <p id="extensions" class="mt-4 text-xs text-gray-600 truncate"></p>
@@ -113,6 +155,204 @@
 
     <script>
       let allSlides = [];
+      let overlaySources = {};
+      const activeOverlayKinds = new Set();
+      const VIEWER_SLIDES_KEY = "fastslide-viewer-slides";
+
+      const OVERLAY_KIND_META = {
+        annotations: {
+          label: "Has annotations",
+          short: "annotations",
+          chipClass: "overlay-chip-ann",
+          activeClass: "overlay-chip-ann-active",
+        },
+        heatmaps: {
+          label: "Has heatmaps",
+          short: "heatmaps",
+          chipClass: "overlay-chip-hm",
+          activeClass: "overlay-chip-hm-active",
+        },
+      };
+
+      function overlayCount(slide, kind) {
+        return slide.overlays?.[kind]?.count ?? 0;
+      }
+
+      function hasOverlayKind(slide, kind) {
+        return overlayCount(slide, kind) > 0;
+      }
+
+      function configuredOverlayKinds() {
+        return Object.keys(overlaySources).filter((kind) => overlaySources[kind]);
+      }
+
+      function hasAnyConfiguredOverlay(slide) {
+        return configuredOverlayKinds().some((kind) => hasOverlayKind(slide, kind));
+      }
+
+      function matchesOverlayFilter(slide) {
+        if (activeOverlayKinds.size === 0) return true;
+        if (activeOverlayKinds.has("__missing__")) {
+          return !hasAnyConfiguredOverlay(slide);
+        }
+        for (const kind of activeOverlayKinds) {
+          if (!hasOverlayKind(slide, kind)) return false;
+        }
+        return true;
+      }
+
+      function toggleOverlayKind(kind) {
+        if (kind === "__missing__") {
+          if (activeOverlayKinds.has("__missing__")) {
+            activeOverlayKinds.delete("__missing__");
+          } else {
+            activeOverlayKinds.clear();
+            activeOverlayKinds.add("__missing__");
+          }
+        } else if (activeOverlayKinds.has(kind)) {
+          activeOverlayKinds.delete(kind);
+        } else {
+          activeOverlayKinds.delete("__missing__");
+          activeOverlayKinds.add(kind);
+        }
+        applyFilter();
+      }
+
+      function clearOverlayFilters() {
+        activeOverlayKinds.clear();
+        applyFilter();
+      }
+
+      function isBrowserFiltered() {
+        return (
+          activeOverlayKinds.size > 0 ||
+          document.getElementById("filter").value.trim() !== ""
+        );
+      }
+
+      function persistViewerSlideList(slides) {
+        const payload = {
+          paths: slides.map((slide) => slide.path),
+          filtered: isBrowserFiltered(),
+        };
+        try {
+          sessionStorage.setItem(VIEWER_SLIDES_KEY, JSON.stringify(payload));
+        } catch (err) {
+          /* ignore quota errors */
+        }
+      }
+
+      function getVisibleSlides() {
+        const q = document.getElementById("filter").value.toLowerCase();
+        return allSlides.filter((slide) => {
+          if (q && !slide.path.toLowerCase().includes(q)) return false;
+          return matchesOverlayFilter(slide);
+        });
+      }
+
+      function countSlidesWithKind(slides, kind) {
+        if (kind === "__missing__") {
+          return slides.filter((slide) => !hasAnyConfiguredOverlay(slide)).length;
+        }
+        return slides.filter((slide) => hasOverlayKind(slide, kind)).length;
+      }
+
+      function overlayFilterSummary(slideCount) {
+        if (activeOverlayKinds.size === 0) {
+          return `Showing all slides · ${slideCount} total`;
+        }
+        if (activeOverlayKinds.has("__missing__")) {
+          return `Showing slides without overlays · ${slideCount} match${
+            slideCount === 1 ? "" : "es"
+          }`;
+        }
+        const parts = [...activeOverlayKinds]
+          .map((kind) => OVERLAY_KIND_META[kind]?.short || kind)
+          .sort();
+        const joiner = parts.length > 1 ? " and " : "";
+        const label =
+          parts.length > 1
+            ? parts.slice(0, -1).join(", ") + joiner + parts[parts.length - 1]
+            : parts[0];
+        return `Showing slides with ${label} · ${slideCount} match${
+          slideCount === 1 ? "" : "es"
+        }`;
+      }
+
+      function makeToggleChip(kind, label, count, meta) {
+        const active = activeOverlayKinds.has(kind);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.className =
+          "overlay-chip inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700";
+        if (meta?.chipClass) button.classList.add(meta.chipClass);
+        if (active && meta?.activeClass) button.classList.add(meta.activeClass);
+        if (active && kind === "__missing__") {
+          button.classList.add("overlay-chip-missing-active");
+        }
+
+        const check = document.createElement("span");
+        check.className = active ? "inline" : "invisible w-0";
+        check.innerHTML =
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-3 h-3"><path fill-rule="evenodd" d="M12.416 3.376a.75.75 0 013.416 5.408l-5.5 6a.75.75 0 01-1.088.035l-2.5-2.5a.75.75 0 111.06-1.06l1.955 1.955 4.985-5.431a.75.75 0 011.088-.407z" clip-rule="evenodd"/></svg>';
+
+        const text = document.createElement("span");
+        text.textContent = `${label} (${count})`;
+
+        button.appendChild(check);
+        button.appendChild(text);
+        button.addEventListener("click", () => toggleOverlayKind(kind));
+        return button;
+      }
+
+      function renderOverlayFilters(textFilteredSlides, resultCount) {
+        const panel = document.getElementById("overlay-filters");
+        const chips = document.getElementById("overlay-filter-chips");
+        const summary = document.getElementById("overlay-filter-summary");
+        const clearBtn = document.getElementById("clear-overlay-filters");
+        const kinds = configuredOverlayKinds();
+
+        if (kinds.length === 0) {
+          panel.classList.add("hidden");
+          return;
+        }
+
+        panel.classList.remove("hidden");
+        chips.innerHTML = "";
+
+        for (const kind of kinds) {
+          const meta = OVERLAY_KIND_META[kind];
+          if (!meta) continue;
+          chips.appendChild(
+            makeToggleChip(
+              kind,
+              meta.label,
+              countSlidesWithKind(textFilteredSlides, kind),
+              meta
+            )
+          );
+        }
+
+        const missingCount = countSlidesWithKind(textFilteredSlides, "__missing__");
+        if (missingCount > 0) {
+          chips.appendChild(
+            makeToggleChip(
+              "__missing__",
+              "Missing overlays",
+              missingCount,
+              null
+            )
+          );
+        }
+
+        summary.textContent = overlayFilterSummary(resultCount);
+        if (activeOverlayKinds.size > 0) {
+          clearBtn.classList.remove("hidden");
+        } else {
+          clearBtn.classList.add("hidden");
+        }
+      }
 
       function formatSize(bytes) {
         if (bytes == null) return "folder";
@@ -123,12 +363,45 @@
         return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
       }
 
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+
+      function overlayBadge(kind, count, layers) {
+        if (!overlaySources[kind]) return "";
+        const labels = {
+          annotations: "ann",
+          heatmaps: "hm",
+        };
+        const colors = {
+          annotations: count > 0 ? "text-amber-300 bg-amber-950/60 border-amber-800/70" : "text-gray-600 bg-gray-800/40 border-gray-700/60",
+          heatmaps: count > 0 ? "text-violet-300 bg-violet-950/60 border-violet-800/70" : "text-gray-600 bg-gray-800/40 border-gray-700/60",
+        };
+        const title =
+          count > 0 && layers?.length
+            ? `${kind}: ${layers.join(", ")}`
+            : count > 0
+              ? `${kind}: ${count} layer${count === 1 ? "" : "s"}`
+              : `No ${kind}`;
+        return `<span title="${escapeHtml(title)}" class="text-[11px] px-1.5 py-0.5 rounded border ${colors[kind]}">${count} ${labels[kind]}</span>`;
+      }
+
       function render(slides) {
         const list = document.getElementById("file-list");
         list.innerHTML = "";
         document.getElementById("count").textContent = `${slides.length} slide${
           slides.length === 1 ? "" : "s"
         }`;
+
+        const textFiltered = allSlides.filter((slide) => {
+          const q = document.getElementById("filter").value.toLowerCase();
+          return !q || slide.path.toLowerCase().includes(q);
+        });
+        renderOverlayFilters(textFiltered, slides.length);
 
         if (slides.length === 0) {
           list.innerHTML =
@@ -137,6 +410,17 @@
         }
 
         slides.forEach((slide) => {
+          const annCount = overlayCount(slide, "annotations");
+          const hmCount = overlayCount(slide, "heatmaps");
+          const annLayers = slide.overlays?.annotations?.layers ?? [];
+          const hmLayers = slide.overlays?.heatmaps?.layers ?? [];
+          const badges = [
+            overlayBadge("annotations", annCount, annLayers),
+            overlayBadge("heatmaps", hmCount, hmLayers),
+          ]
+            .filter(Boolean)
+            .join("");
+
           const a = document.createElement("a");
           a.href = `/viewer?slide=${encodeURIComponent(slide.path)}`;
           a.className =
@@ -147,32 +431,31 @@
                 <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5z" />
               </svg>
               <div class="min-w-0">
-                <div class="text-sm font-medium text-gray-100 truncate">${
+                <div class="text-sm font-medium text-gray-100 truncate">${escapeHtml(
                   slide.name
-                }</div>
-                <div class="text-xs text-gray-500 font-mono truncate">${
+                )}</div>
+                <div class="text-xs text-gray-500 font-mono truncate">${escapeHtml(
                   slide.path
-                }</div>
+                )}</div>
               </div>
             </div>
-            <span class="text-xs text-gray-500 shrink-0">${formatSize(
-              slide.size_bytes
-            )}</span>`;
+            <div class="flex items-center gap-2 shrink-0">
+              ${badges ? `<div class="hidden sm:flex items-center gap-1">${badges}</div>` : ""}
+              <span class="text-xs text-gray-500">${formatSize(slide.size_bytes)}</span>
+            </div>`;
           list.appendChild(a);
         });
       }
 
       function applyFilter() {
-        const q = document.getElementById("filter").value.toLowerCase();
-        if (!q) {
-          render(allSlides);
-          return;
-        }
-        render(allSlides.filter((s) => s.path.toLowerCase().includes(q)));
+        const filtered = getVisibleSlides();
+        persistViewerSlideList(filtered);
+        render(filtered);
       }
 
       function showLoading() {
         document.getElementById("count").textContent = "";
+        document.getElementById("overlay-filters").classList.add("hidden");
         document.getElementById("file-list").innerHTML = `
           <div class="flex flex-col items-center justify-center text-gray-500 py-16 gap-4">
             <svg class="animate-spin h-8 w-8 text-primary-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -200,13 +483,18 @@
         }
         const data = await resp.json();
         allSlides = data.slides;
+        overlaySources = data.overlay_sources ?? {};
         document.getElementById("root-path").textContent = data.root;
         document.getElementById("extensions").textContent =
           "Supported: " + data.extensions.join(", ");
         render(allSlides);
+        persistViewerSlideList(allSlides);
         document
           .getElementById("filter")
           .addEventListener("input", applyFilter);
+        document
+          .getElementById("clear-overlay-filters")
+          .addEventListener("click", clearOverlayFilters);
       }
 
       init();
