@@ -312,6 +312,22 @@ class HeatmapDatabase:
                 return None
             raise
 
+    @classmethod
+    def try_list_heatmaps_at(cls, db_path: str | Path) -> list[HeatmapRecord] | None:
+        """List heatmap layers once and close the SQLite connection.
+
+        Use this for bulk metadata scans (for example ``/api/slides``) instead of
+        :meth:`for_path`, which caches one open connection per database per thread.
+        """
+        path = Path(db_path)
+        if not path.is_file():
+            return None
+        db = cls(path, create=False)
+        try:
+            return db.try_list_heatmaps()
+        finally:
+            db.close()
+
     @staticmethod
     def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
         message = str(exc).lower()

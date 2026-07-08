@@ -162,7 +162,7 @@ def _attach_overlay_metadata(
     slides: list[dict[str, object]],
     *,
     annotations_root: Path | None,
-    heatmap_db_for_slide: Callable[[str], HeatmapDatabase | None],
+    heatmap_db_path_for_slide: Callable[[str], Path | None],
     find_annotation_files: Callable[[str], list[Path]],
 ) -> None:
     for slide in slides:
@@ -170,9 +170,9 @@ def _attach_overlay_metadata(
         overlays: dict[str, dict[str, object]] = {}
         if annotations_root is not None:
             overlays["annotations"] = _overlay_summary(find_annotation_files(rel), annotations_root)
-        db = heatmap_db_for_slide(rel)
-        if db is not None:
-            layers = db.try_list_heatmaps()
+        db_path = heatmap_db_path_for_slide(rel)
+        if db_path is not None:
+            layers = HeatmapDatabase.try_list_heatmaps_at(db_path)
             if layers is None:
                 overlays["heatmaps"] = {"count": 0, "layers": [], "pending": True}
             else:
@@ -234,14 +234,20 @@ def create_app(
 
     extensions = _supported_extensions()
 
-    def heatmap_db_for_slide(rel: str) -> HeatmapDatabase | None:
+    def heatmap_db_path_for_slide(rel: str) -> Path | None:
         if heatmaps_db_file is not None:
-            return HeatmapDatabase.for_path(heatmaps_db_file)
+            return heatmaps_db_file
         for root in heatmaps_search_roots:
             db_path = HeatmapDatabase.resolve_path(root, rel)
             if db_path is not None:
-                return HeatmapDatabase.for_path(db_path)
+                return db_path
         return None
+
+    def heatmap_db_for_slide(rel: str) -> HeatmapDatabase | None:
+        db_path = heatmap_db_path_for_slide(rel)
+        if db_path is None:
+            return None
+        return HeatmapDatabase.for_path(db_path)
 
     @functools.lru_cache(maxsize=256)
     def _flat_overlay_files(directory: str, extensions_key: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
@@ -341,7 +347,7 @@ def create_app(
         _attach_overlay_metadata(
             slides,
             annotations_root=annotations_root,
-            heatmap_db_for_slide=heatmap_db_for_slide,
+            heatmap_db_path_for_slide=heatmap_db_path_for_slide,
             find_annotation_files=find_annotation_files,
         )
         overlay_sources: dict[str, bool] = {}
@@ -578,9 +584,25 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _warn_fd_limit() -> None:
+    """Warn when the process soft open-file limit is likely too low for the viewer."""
+    import resource
+    import sys
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < 4096:
+        print(
+            f"WARNING: open-file limit is {soft} (hard {hard}). "
+            "Heavy viewer use may fail with 'Too many open files'. "
+            "Run: ulimit -n 65536",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     """CLI entry point."""
     args = _parse_args()
+    _warn_fd_limit()
     app = create_app(
         args.root,
         tile_size=args.tile_size,
