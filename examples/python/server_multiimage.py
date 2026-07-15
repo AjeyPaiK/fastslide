@@ -42,6 +42,12 @@ For a slide ``sub/4104 T2.mrxs`` the server collects, under the annotations dir:
   slide stem (``<dir>/4104 T2/`` or ``<dir>/sub/4104 T2/``), and
 - flat files whose name is the slide stem or the stem followed by a separator,
   e.g. ``4104 T2.json`` and ``4104 T2_tissue_foreground.json``.
+
+``--annotations-dir`` is repeatable, so annotations for the same slide can be
+served from several folders at once. Prefix a value with ``LABEL=`` to tag a
+source (e.g. ``--annotations-dir human=/path/a --annotations-dir ai=/path/b``);
+each layer name is then prefixed with its label and the viewer shows the label
+in the legend, keeping equivalent human/AI annotations distinct.
 """
 
 from __future__ import annotations
@@ -129,6 +135,18 @@ _ANNOTATION_EXTENSIONS = (".json", ".geojson")
 # starts with this one (``4104 T2`` must not match ``4104 T21``).
 _STEM_SEPARATORS = ("_", "-", " ", ".", "(")
 
+# Default overlay colors assigned by source order, so annotations from different
+# folders are visually distinct without manual recoloring: first source green,
+# second yellow, then a few more distinct hues for additional sources.
+_ANNOTATION_SOURCE_COLORS = (
+    "#22c55e",  # green
+    "#facc15",  # yellow
+    "#f97316",  # orange
+    "#3b82f6",  # blue
+    "#a855f7",  # purple
+    "#ec4899",  # pink
+)
+
 
 def _collect_geojson(directory: Path) -> list[Path]:
     """Returns every GeoJSON file under ``directory`` (recursively)."""
@@ -153,23 +171,56 @@ def _overlay_layer_name(root: Path, path: Path) -> str:
         return path.stem
 
 
-def _overlay_summary(paths: list[Path], root: Path) -> dict[str, object]:
-    layers = sorted({_overlay_layer_name(root, path) for path in paths})
-    return {"count": len(layers), "layers": layers}
+def _parse_annotation_source(spec: str | Path) -> tuple[str | None, Path]:
+    """Parses one ``--annotations-dir`` value into ``(label, path)``.
+
+    Accepts ``label=path`` to tag a source's layers, or a bare ``path``. The
+    label must be a simple token (no path separators) so that paths containing
+    ``=`` are not mistaken for a labelled spec.
+    """
+    if isinstance(spec, Path):
+        return None, spec
+    text = str(spec)
+    if "=" in text:
+        candidate, _, rest = text.partition("=")
+        if candidate and "/" not in candidate and os.sep not in candidate and rest:
+            return candidate, Path(rest)
+    return None, Path(text)
+
+
+def _normalize_annotation_sources(
+    annotations_dir: str | Path | list[str | Path] | tuple[str | Path, ...] | None,
+) -> list[tuple[str | None, Path]]:
+    """Resolves ``annotations_dir`` into a list of ``(label, root)`` pairs."""
+    if annotations_dir is None:
+        specs: list[str | Path] = []
+    elif isinstance(annotations_dir, (str, Path)):
+        specs = [annotations_dir]
+    else:
+        specs = list(annotations_dir)
+    sources: list[tuple[str | None, Path]] = []
+    for spec in specs:
+        label, path = _parse_annotation_source(spec)
+        root = Path(path).resolve()
+        if not root.is_dir():
+            raise NotADirectoryError(f"not a directory: {root}")
+        sources.append((label, root))
+    return sources
 
 
 def _attach_overlay_metadata(
     slides: list[dict[str, object]],
     *,
-    annotations_root: Path | None,
+    has_annotations: bool,
     heatmap_db_path_for_slide: Callable[[str], Path | None],
-    find_annotation_files: Callable[[str], list[Path]],
+    find_annotation_layers: Callable[[str], list[tuple[Path, str, str | None]]],
 ) -> None:
     for slide in slides:
         rel = str(slide["path"])
         overlays: dict[str, dict[str, object]] = {}
-        if annotations_root is not None:
-            overlays["annotations"] = _overlay_summary(find_annotation_files(rel), annotations_root)
+        if has_annotations:
+            names = sorted({name for _, name, _ in find_annotation_layers(rel)})
+            overlays["annotations"] = {"count": len(names), "layers": names}
         db_path = heatmap_db_path_for_slide(rel)
         if db_path is not None:
             layers = HeatmapDatabase.try_list_heatmaps_at(db_path)
@@ -186,7 +237,7 @@ def create_app(
     root: str | Path,
     tile_size: int = 256,
     jpeg_quality: int = 85,
-    annotations_dir: str | Path | None = None,
+    annotations_dir: str | Path | list[str | Path] | tuple[str | Path, ...] | None = None,
     heatmaps_dir: str | Path | None = None,
     heatmaps_db: str | Path | None = None,
 ) -> FastAPI:
@@ -196,8 +247,12 @@ def create_app(
         root: Directory to scan for supported slides (searched recursively).
         tile_size: Tile edge length in pixels.
         jpeg_quality: Quality used when encoding JPEG tiles.
-        annotations_dir: Optional directory holding per-slide GeoJSON files,
-            matched by the slide's file stem (and mirrored sub-path).
+        annotations_dir: Optional directory (or list of directories) holding
+            per-slide GeoJSON files, matched by the slide's file stem (and
+            mirrored sub-path). Each entry may be a bare path or ``label=path``;
+            when several sources are given (or a label is set) every layer name
+            is prefixed with its source label so overlapping annotations from
+            different sources (e.g. ``human`` vs ``ai``) stay distinct.
         heatmaps_dir: Optional directory of per-slide ``heatmaps.sqlite`` databases,
             matched like annotations (per-slide subfolder or stem-named file).
         heatmaps_db: Optional SQLite database file or directory of per-slide
@@ -211,9 +266,21 @@ def create_app(
     if not root_dir.is_dir():
         raise NotADirectoryError(f"not a directory: {root_dir}")
 
-    annotations_root = Path(annotations_dir).resolve() if annotations_dir else None
-    if annotations_root is not None and not annotations_root.is_dir():
-        raise NotADirectoryError(f"not a directory: {annotations_root}")
+    annotation_sources = _normalize_annotation_sources(annotations_dir)
+    # Prefix layer names with their source label when disambiguation is needed:
+    # more than one source, or an explicit label was given for a single source.
+    prefix_labels = len(annotation_sources) > 1 or any(
+        label is not None for label, _ in annotation_sources
+    )
+    # Default color per source label (by source order): first folder green,
+    # second yellow, etc. The viewer uses this as each layer's initial color.
+    annotation_source_colors: dict[str, str] = {}
+    for idx, (label, root) in enumerate(annotation_sources):
+        eff_label = label if label is not None else (root.name if prefix_labels else None)
+        if eff_label is not None and eff_label not in annotation_source_colors:
+            annotation_source_colors[eff_label] = _ANNOTATION_SOURCE_COLORS[
+                idx % len(_ANNOTATION_SOURCE_COLORS)
+            ]
 
     heatmaps_dir_path = Path(heatmaps_dir).resolve() if heatmaps_dir else None
     if heatmaps_dir_path is not None and not heatmaps_dir_path.is_dir():
@@ -272,44 +339,60 @@ def create_app(
             raise HTTPException(status_code=404, detail="slide not found")
         return candidate
 
-    def find_annotation_files(rel: str) -> list[Path]:
-        """Returns every GeoJSON annotation file belonging to a slide.
+    def find_annotation_layers(rel: str) -> list[tuple[Path, str, str | None]]:
+        """Returns ``(path, layer_name, source_label)`` for a slide's annotations.
 
-        Two layouts are supported and combined: a per-slide subfolder named
-        after the slide stem (all GeoJSON inside it), and flat files whose name
-        is the slide stem (optionally followed by a separator and a suffix).
+        Every configured source is searched with the same two combined layouts:
+        a per-slide subfolder named after the slide stem (all GeoJSON inside it),
+        and flat files whose name is the slide stem (optionally followed by a
+        separator and a suffix). When more than one source is configured (or a
+        source carries an explicit label) each ``layer_name`` is prefixed with
+        that source's label so equivalent annotations from different sources do
+        not collide.
         """
-        if annotations_root is None:
+        if not annotation_sources:
             return []
         rel_path = Path(rel)
         stem = rel_path.stem
-        found: dict[Path, None] = {}
+        # Keyed by resolved path so the same file is never emitted twice.
+        layers: dict[Path, tuple[str, str | None]] = {}
 
-        # 1) Per-slide subfolder holding all of that slide's annotation layers.
-        for subdir in (annotations_root / stem, annotations_root / rel_path.parent / stem):
-            if subdir.is_dir():
-                for f in _collect_geojson(subdir):
-                    found[f.resolve()] = None
+        for label, root in annotation_sources:
+            eff_label = label if label is not None else (root.name if prefix_labels else None)
+            found: list[Path] = []
 
-        # 2) Flat files matching the stem exactly or stem + separator + suffix.
-        for directory in (annotations_root, annotations_root / rel_path.parent):
-            if not directory.is_dir():
-                continue
-            for file_stem, resolved_str in _flat_overlay_files(
-                str(directory.resolve()), _ANNOTATION_EXTENSIONS
-            ):
-                if _stem_matches_slide(file_stem, stem):
-                    found[Path(resolved_str)] = None
+            # 1) Per-slide subfolder holding all of that slide's annotation layers.
+            for subdir in (root / stem, root / rel_path.parent / stem):
+                if subdir.is_dir():
+                    found.extend(_collect_geojson(subdir))
 
-        # Guard against path traversal and return a stable, sorted list.
-        result: list[Path] = []
-        for resolved in found:
-            try:
-                resolved.relative_to(annotations_root)
-            except ValueError:
-                continue
-            result.append(resolved)
-        return sorted(result)
+            # 2) Flat files matching the stem exactly or stem + separator + suffix.
+            for directory in (root, root / rel_path.parent):
+                if not directory.is_dir():
+                    continue
+                for file_stem, resolved_str in _flat_overlay_files(
+                    str(directory.resolve()), _ANNOTATION_EXTENSIONS
+                ):
+                    if _stem_matches_slide(file_stem, stem):
+                        found.append(Path(resolved_str))
+
+            for path in found:
+                resolved = path.resolve()
+                if resolved in layers:
+                    continue
+                # Guard against path traversal outside this source's root.
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    continue
+                base = _overlay_layer_name(root, resolved)
+                name = f"{eff_label}/{base}" if eff_label else base
+                layers[resolved] = (name, eff_label)
+
+        return sorted(
+            ((path, name, source) for path, (name, source) in layers.items()),
+            key=lambda item: item[1],
+        )
 
     # Cache the opened slide per relative path so repeated tile requests reuse
     # the same reader. The cached tuple keeps the FastSlide handle alive, which
@@ -346,12 +429,12 @@ def create_app(
         slides = _list_slides(root_dir, extensions)
         _attach_overlay_metadata(
             slides,
-            annotations_root=annotations_root,
+            has_annotations=bool(annotation_sources),
             heatmap_db_path_for_slide=heatmap_db_path_for_slide,
-            find_annotation_files=find_annotation_files,
+            find_annotation_layers=find_annotation_layers,
         )
         overlay_sources: dict[str, bool] = {}
-        if annotations_root is not None:
+        if annotation_sources:
             overlay_sources["annotations"] = True
         if heatmaps_db_file is not None or heatmaps_search_roots:
             overlay_sources["heatmaps"] = True
@@ -387,24 +470,26 @@ def create_app(
     def annotations(slide: str = Query(...)) -> JSONResponse:
         resolve_slide(slide)  # validate the slide reference (404 otherwise)
         items: list[dict[str, object]] = []
-        for path in find_annotation_files(slide):
+        for path, name, source in find_annotation_layers(slide):
             try:
                 geojson = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            try:
-                name = path.relative_to(annotations_root).with_suffix("").as_posix()
-            except ValueError:
-                name = path.stem
-            items.append({"name": name, "geojson": geojson})
+            item: dict[str, object] = {"name": name, "geojson": geojson}
+            if source:
+                item["source"] = source
+                color = annotation_source_colors.get(source)
+                if color:
+                    item["color"] = color
+            items.append(item)
         return JSONResponse({"annotations": items})
 
     def _annotation_titles(slide: str) -> dict[str, str]:
-        """Maps annotation relative keys to GeoJSON display titles."""
-        if annotations_root is None:
+        """Maps annotation layer names to GeoJSON display titles."""
+        if not annotation_sources:
             return {}
         titles: dict[str, str] = {}
-        for path in find_annotation_files(slide):
+        for path, name, _ in find_annotation_layers(slide):
             try:
                 geojson = json.loads(path.read_text())
             except (OSError, ValueError):
@@ -412,11 +497,7 @@ def create_app(
             label = geojson_labels.geojson_title(geojson)
             if not label:
                 continue
-            try:
-                key = path.relative_to(annotations_root).with_suffix("").as_posix()
-            except ValueError:
-                key = path.stem
-            titles[key] = label
+            titles[name] = label
         return titles
 
     def _heatmap_display_title(heatmap_key: str, ann_titles: dict[str, str]) -> str | None:
@@ -565,8 +646,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality 1-100 (default: 85).")
     parser.add_argument(
         "--annotations-dir",
+        action="append",
+        metavar="[LABEL=]DIR",
         default=None,
-        help="Directory of per-slide GeoJSON files (matched by slide stem).",
+        help=(
+            "Directory of per-slide GeoJSON files (matched by slide stem). "
+            "Repeatable; prefix a value with 'LABEL=' to tag that source's "
+            "layers, e.g. --annotations-dir human=/path/a --annotations-dir "
+            "ai=/path/b."
+        ),
     )
     parser.add_argument(
         "--heatmaps-dir",
